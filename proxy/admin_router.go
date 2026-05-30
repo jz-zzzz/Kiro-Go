@@ -94,6 +94,8 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiMetricsTimeseries(w, r)
 	case path == "/metrics/top" && r.Method == "GET":
 		h.apiMetricsTop(w, r)
+	case path == "/metrics/live" && r.Method == "GET":
+		h.apiMetricsLive(w, r)
 	case path == "/metrics/reset" && r.Method == "POST":
 		h.apiMetricsReset(w, r)
 	case path == "/generate-machine-id" && r.Method == "GET":

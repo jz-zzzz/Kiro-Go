@@ -193,6 +193,54 @@ func (h *Handler) apiMetricsReset(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})
 }
 
+// apiMetricsLive serves the real-time concurrency dashboard payload:
+// concurrency overview (current vs configured limits + cumulative counters),
+// per-account concurrency distribution (with email + limit), and the most
+// recent request records for the live request stream.
+func (h *Handler) apiMetricsLive(w http.ResponseWriter, r *http.Request) {
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	if limit <= 0 || limit > metricsLiveCapacity {
+		limit = 50
+	}
+
+	rc := config.GetRoutingConcurrencyConfig()
+	stats := h.pool.RoutingStats()
+
+	// Per-account concurrency: enrich {accountId: active} with email + limit.
+	perAccount := make([]map[string]interface{}, 0)
+	if raw, ok := stats["perAccountActive"].(map[string]int); ok {
+		for id, active := range raw {
+			entry := map[string]interface{}{
+				"accountId": id,
+				"active":    active,
+				"limit":     rc.PerAccountMaxConcurrent,
+			}
+			if acc := h.pool.GetByID(id); acc != nil {
+				entry["email"] = acc.Email
+			}
+			perAccount = append(perAccount, entry)
+		}
+	}
+
+	concurrency := map[string]interface{}{
+		"enabled":        rc.Enabled,
+		"active":         stats["active"],
+		"maxConcurrent":  rc.GlobalMaxConcurrent,
+		"waiting":        stats["waiting"],
+		"queueSize":      rc.GlobalQueueSize,
+		"enqueuedTotal":  stats["enqueuedTotal"],
+		"processedTotal": stats["processedTotal"],
+		"rejectedTotal":  stats["rejectedTotal"],
+		"timeoutTotal":   stats["timeoutTotal"],
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"concurrency": concurrency,
+		"perAccount":  perAccount,
+		"recent":      recentLiveRequests(limit),
+	})
+}
+
 // apiGenerateMachineId 生成新的机器码
 func (h *Handler) apiGenerateMachineId(w http.ResponseWriter, r *http.Request) {
 	machineId := config.GenerateMachineId()

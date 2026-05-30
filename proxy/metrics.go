@@ -669,6 +669,27 @@ func recordRequestMetrics(protocol, model string, stream bool, account *config.A
 		sample.Subscription = strings.TrimSpace(strings.TrimSpace(account.SubscriptionType + " " + account.SubscriptionTitle))
 	}
 	recordMetricsSample(sample)
+
+	// Also append to the in-memory live request stream (newest-first ring).
+	live := LiveRequestRecord{
+		Timestamp:    sample.Timestamp,
+		Protocol:     protocol,
+		Model:        model,
+		Stream:       stream,
+		Success:      success,
+		StatusCode:   statusCode,
+		ErrorType:    errorType,
+		InputTokens:  inputTokens,
+		OutputTokens: outputTokens,
+		TotalTokens:  inputTokens + outputTokens,
+		LatencyMs:    sample.LatencyMs,
+		TTFTMs:       sample.TTFTMs,
+	}
+	if account != nil {
+		live.AccountID = account.ID
+		live.AccountEmail = account.Email
+	}
+	recordLiveRequest(live)
 }
 
 func apiKeyMetricsName(apiKeyID string) string {

@@ -60,6 +60,12 @@ type AccountPool struct {
 	routeNotify             chan struct{}
 	lastAutoRestoreRefresh  time.Time
 	autoRestoreRefresh      bool
+
+	// Cumulative routing counters (lifetime since process start).
+	routeEnqueuedTotal  uint64 // requests that had to wait in the queue at least once
+	routeProcessedTotal uint64 // requests that successfully acquired a route slot
+	routeRejectedTotal  uint64 // requests rejected because the queue was full
+	routeTimeoutTotal   uint64 // requests that timed out while waiting in the queue
 }
 
 var (
@@ -321,6 +327,7 @@ func (p *AccountPool) AcquireForModel(ctx context.Context, model string, exclude
 		if acc == nil {
 			return nil, nil, ErrRoutingUnavailable
 		}
+		atomic.AddUint64(&p.routeProcessedTotal, 1)
 		return acc, func() {}, nil
 	}
 
@@ -347,6 +354,7 @@ func (p *AccountPool) AcquireForModel(ctx context.Context, model string, exclude
 			return nil, nil, err
 		}
 		if res.account != nil {
+			atomic.AddUint64(&p.routeProcessedTotal, 1)
 			return res.account, p.releaseRouteFunc(res.account.ID), nil
 		}
 		if !res.busy {
@@ -354,16 +362,19 @@ func (p *AccountPool) AcquireForModel(ctx context.Context, model string, exclude
 		}
 		if !queued {
 			if rc.GlobalQueueSize <= 0 {
+				atomic.AddUint64(&p.routeRejectedTotal, 1)
 				return nil, nil, ErrRoutingQueueFull
 			}
 			p.mu.Lock()
 			if p.routeWaiting >= rc.GlobalQueueSize {
 				p.mu.Unlock()
+				atomic.AddUint64(&p.routeRejectedTotal, 1)
 				return nil, nil, ErrRoutingQueueFull
 			}
 			p.routeWaiting++
 			queued = true
 			p.mu.Unlock()
+			atomic.AddUint64(&p.routeEnqueuedTotal, 1)
 		}
 
 		var intervalC <-chan time.Time
@@ -382,6 +393,7 @@ func (p *AccountPool) AcquireForModel(ctx context.Context, model string, exclude
 			if timer != nil {
 				timer.Stop()
 			}
+			atomic.AddUint64(&p.routeTimeoutTotal, 1)
 			return nil, nil, ErrRoutingQueueTimeout
 		case <-res.notify:
 			if timer != nil {
@@ -516,6 +528,10 @@ func (p *AccountPool) RoutingStats() map[string]interface{} {
 		"active":           p.routeGlobalActive,
 		"waiting":          p.routeWaiting,
 		"perAccountActive": perAccount,
+		"enqueuedTotal":    atomic.LoadUint64(&p.routeEnqueuedTotal),
+		"processedTotal":   atomic.LoadUint64(&p.routeProcessedTotal),
+		"rejectedTotal":    atomic.LoadUint64(&p.routeRejectedTotal),
+		"timeoutTotal":     atomic.LoadUint64(&p.routeTimeoutTotal),
 	}
 }
 

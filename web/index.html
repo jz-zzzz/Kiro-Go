@@ -105,6 +105,8 @@
                 data-i18n="tabs.accounts"></span></button>
             <button type="button" class="tab" data-tab="settings"><i class="fa-solid fa-sliders tab-icon"></i><span
                 data-i18n="tabs.settings"></span></button>
+            <button type="button" class="tab" data-tab="metrics"><i class="fa-solid fa-chart-line tab-icon"></i><span
+                data-i18n="tabs.metrics"></span></button>
             <button type="button" class="tab" data-tab="api"><i class="fa-solid fa-plug tab-icon"></i><span
                 data-i18n="tabs.api"></span></button>
           </div>
@@ -203,28 +205,63 @@
             </div>
           </div>
 
-          <div class="toolbar">
-            <label class="flex items-center gap-1.5 cursor-pointer select-none shrink-0">
-              <input type="checkbox" id="selectAllCheckbox" />
-              <span class="text-xs" data-i18n="batch.selectAll"></span>
-            </label>
-            <div id="batchBar" class="batch-bar hidden">
-              <span id="batchCount" class="batch-count"></span>
-              <button class="btn btn-primary btn-xs" data-batch="enable" data-i18n="batch.enable"></button>
-              <button class="btn btn-secondary btn-xs" data-batch="disable" data-i18n="batch.disable"></button>
-              <button class="btn btn-secondary btn-xs" data-batch="refresh" data-i18n="batch.refresh"></button>
-              <button class="btn btn-secondary btn-xs" data-batch="refreshModels"
-                data-i18n="batch.refreshModels"></button>
-              <button class="btn btn-danger btn-xs" data-batch="delete" data-i18n="batch.delete"></button>
+          <div id="accountsSummary" class="accounts-summary"></div>
+
+          <div class="toolbar accounts-toolbar">
+            <div class="bulk-select-row">
+              <label class="flex items-center gap-1.5 cursor-pointer select-none shrink-0">
+                <input type="checkbox" id="selectAllCheckbox" />
+                <span class="text-xs" data-i18n="batch.selectAll"></span>
+              </label>
+              <div id="batchBar" class="batch-bar hidden">
+                <span id="batchCount" class="batch-count"></span>
+                <button class="btn btn-primary btn-xs" data-batch="enable" data-i18n="batch.enable"></button>
+                <button class="btn btn-secondary btn-xs" data-batch="disable" data-i18n="batch.disable"></button>
+                <button class="btn btn-secondary btn-xs" data-batch="refresh" data-i18n="batch.refresh"></button>
+                <button class="btn btn-secondary btn-xs" data-batch="refreshModels"
+                  data-i18n="batch.refreshModels"></button>
+                <button class="btn btn-secondary btn-xs" data-batch="testAuto" data-i18n="batch.testAuto"></button>
+                <button class="btn btn-danger btn-xs" data-batch="delete" data-i18n="batch.delete"></button>
+              </div>
             </div>
-            <div class="toolbar-spacer"></div>
-            <input type="text" id="filterSearch" class="w-56!" data-i18n-placeholder="filter.search" />
-            <select id="filterStatusSelect" class="w-32!" data-i18n-aria-label="filter.status">
-              <option value="all" data-i18n="filter.all"></option>
-              <option value="enabled" data-i18n="filter.enabled"></option>
-              <option value="disabled" data-i18n="filter.disabled"></option>
-              <option value="banned" data-i18n="filter.banned"></option>
-            </select>
+            <div class="view-toggle" role="group" data-i18n-aria-label="accounts.viewMode">
+              <button class="view-toggle-btn" type="button" data-view-mode="card" data-i18n="accounts.viewCard"></button>
+              <button class="view-toggle-btn" type="button" data-view-mode="list" data-i18n="accounts.viewList"></button>
+            </div>
+            <div class="filter-grid">
+              <input type="text" id="filterSearch" data-i18n-placeholder="filter.search" />
+              <select id="filterStatusSelect" data-i18n-aria-label="filter.status">
+                <option value="all" data-i18n="filter.all"></option>
+                <option value="ready" data-i18n="filter.ready"></option>
+                <option value="cooling" data-i18n="filter.cooling"></option>
+                <option value="quota" data-i18n="filter.quota"></option>
+                <option value="recent429" data-i18n="filter.recent429"></option>
+                <option value="auth" data-i18n="filter.authDisabled"></option>
+                <option value="blocked" data-i18n="filter.blocked"></option>
+                <option value="token" data-i18n="filter.token"></option>
+                <option value="disabled" data-i18n="filter.disabled"></option>
+                <option value="banned" data-i18n="filter.banned"></option>
+              </select>
+              <select id="filterTierSelect" data-i18n-aria-label="filter.tier">
+                <option value="all" data-i18n="filter.tierAll"></option>
+                <option value="free" data-i18n="subscription.free"></option>
+                <option value="pro" data-i18n="subscription.pro"></option>
+                <option value="proplus" data-i18n="subscription.proPlus"></option>
+                <option value="power" data-i18n="subscription.power"></option>
+              </select>
+              <select id="filterProxySelect" data-i18n-aria-label="filter.proxy">
+                <option value="all" data-i18n="filter.proxyAll"></option>
+                <option value="global" data-i18n="filter.proxyGlobal"></option>
+                <option value="dedicated" data-i18n="filter.proxyDedicated"></option>
+              </select>
+              <select id="filterSortSelect" data-i18n-aria-label="filter.sort">
+                <option value="health" data-i18n="filter.sortHealth"></option>
+                <option value="quota" data-i18n="filter.sortQuota"></option>
+                <option value="usage" data-i18n="filter.sortUsage"></option>
+                <option value="error" data-i18n="filter.sortError"></option>
+                <option value="requests" data-i18n="filter.sortRequests"></option>
+              </select>
+            </div>
           </div>
 
           <div id="accountsList"></div>
@@ -233,6 +270,15 @@
 
       <!-- Settings tab -->
       <div id="tabSettings" class="tab-content hidden">
+        <div class="settings-subtabs" id="settingsSubtabs" role="tablist" aria-label="" data-i18n-aria-label="settings.sections">
+          <button type="button" class="settings-subtab active" data-settings-tab="access" role="tab" data-i18n="settings.tabAccess"></button>
+          <button type="button" class="settings-subtab" data-settings-tab="routing" role="tab" data-i18n="settings.tabRouting"></button>
+          <button type="button" class="settings-subtab" data-settings-tab="model" role="tab" data-i18n="settings.tabModel"></button>
+          <button type="button" class="settings-subtab" data-settings-tab="system" role="tab" data-i18n="settings.tabSystem"></button>
+          <button type="button" class="settings-subtab" data-settings-tab="advanced" role="tab" data-i18n="settings.tabAdvanced"></button>
+        </div>
+
+        <div class="settings-panel active" id="settingsPanelAccess" data-settings-panel="access" role="tabpanel">
         <!-- API settings -->
         <div class="card">
           <div class="card-header"><span class="card-title" data-i18n="settings.apiSettings"></span></div>
@@ -257,7 +303,9 @@
           </div>
           <div id="apiKeysList"></div>
         </div>
+        </div>
 
+        <div class="settings-panel" id="settingsPanelRouting" data-settings-panel="routing" role="tabpanel" hidden>
         <!-- Usage settings -->
         <div class="card">
           <div class="card-header"><span class="card-title" data-i18n="settings.usageSettings"></span></div>
@@ -271,6 +319,77 @@
           <button class="btn btn-primary" id="saveOverUsageBtn" data-i18n="settings.saveUsage"></button>
         </div>
 
+        <!-- Balancing settings -->
+        <div class="card">
+          <div class="card-header"><span class="card-title" data-i18n="settings.balanceMode"></span></div>
+          <div class="form-group">
+            <label data-i18n="settings.balanceMode"></label>
+            <select id="balanceMode">
+              <option value="health" data-i18n="settings.balanceModeHealth"></option>
+              <option value="managed" data-i18n="settings.balanceModeManaged"></option>
+              <option value="aggressive" data-i18n="settings.balanceModeAggressive"></option>
+            </select>
+            <small data-i18n="settings.balanceModeHint"></small>
+          </div>
+          <button class="btn btn-primary" id="saveBalanceModeBtn" data-i18n="settings.saveBalanceMode"></button>
+        </div>
+
+        <!-- Routing concurrency settings -->
+        <div class="card">
+          <div class="card-header"><span class="card-title" data-i18n="settings.routingConcurrency"></span></div>
+          <div class="form-group">
+            <label class="flex items-center gap-2">
+              <span class="switch"><input type="checkbox" id="routingConcurrencyEnabled" /><span class="slider"></span></span>
+              <span data-i18n="settings.routingConcurrencyEnabled"></span>
+            </label>
+            <small data-i18n="settings.routingConcurrencyHint"></small>
+          </div>
+          <div class="settings-grid">
+            <div class="form-group">
+              <label data-i18n="settings.globalMaxConcurrent"></label>
+              <input type="number" id="globalMaxConcurrent" min="0" placeholder="20" />
+              <small data-i18n="settings.globalMaxConcurrentHint"></small>
+            </div>
+            <div class="form-group">
+              <label data-i18n="settings.globalQueueSize"></label>
+              <input type="number" id="globalQueueSize" min="0" placeholder="100" />
+              <small data-i18n="settings.globalQueueSizeHint"></small>
+            </div>
+            <div class="form-group">
+              <label data-i18n="settings.globalQueueTimeoutMs"></label>
+              <input type="number" id="globalQueueTimeoutMs" min="1" placeholder="30000" />
+              <small data-i18n="settings.globalQueueTimeoutMsHint"></small>
+            </div>
+            <div class="form-group">
+              <label data-i18n="settings.perAccountMaxConcurrent"></label>
+              <input type="number" id="perAccountMaxConcurrent" min="1" placeholder="1" />
+              <small data-i18n="settings.perAccountMaxConcurrentHint"></small>
+            </div>
+            <div class="form-group">
+              <label data-i18n="settings.perAccountMinIntervalMs"></label>
+              <input type="number" id="perAccountMinIntervalMs" min="0" placeholder="1500" />
+              <small data-i18n="settings.perAccountMinIntervalMsHint"></small>
+            </div>
+          </div>
+          <div class="form-group">
+            <label class="flex items-center gap-2">
+              <span class="switch"><input type="checkbox" id="stickyAccount" checked /><span class="slider"></span></span>
+              <span data-i18n="settings.stickyAccount"></span>
+            </label>
+            <small data-i18n="settings.stickyAccountHint"></small>
+          </div>
+          <div class="form-group">
+            <label class="flex items-center gap-2">
+              <span class="switch"><input type="checkbox" id="overflowToOtherAccounts" checked /><span class="slider"></span></span>
+              <span data-i18n="settings.overflowToOtherAccounts"></span>
+            </label>
+            <small data-i18n="settings.overflowToOtherAccountsHint"></small>
+          </div>
+          <button class="btn btn-primary" id="saveRoutingConcurrencyBtn" data-i18n="settings.saveRoutingConcurrency"></button>
+        </div>
+        </div>
+
+        <div class="settings-panel" id="settingsPanelModel" data-settings-panel="model" role="tabpanel" hidden>
         <!-- Thinking settings -->
         <div class="card">
           <div class="card-header"><span class="card-title" data-i18n="settings.thinkingSettings"></span></div>
@@ -320,7 +439,9 @@
           </div>
           <button class="btn btn-primary" id="saveEndpointBtn" data-i18n="settings.saveEndpoint"></button>
         </div>
+        </div>
 
+        <div class="settings-panel" id="settingsPanelSystem" data-settings-panel="system" role="tabpanel" hidden>
         <!-- Admin password -->
         <div class="card">
           <div class="card-header"><span class="card-title" data-i18n="settings.adminPassword"></span></div>
@@ -362,7 +483,9 @@
           </div>
           <button class="btn btn-primary" id="saveProxyBtn" data-i18n="settings.saveProxy"></button>
         </div>
+        </div>
 
+        <div class="settings-panel" id="settingsPanelAdvanced" data-settings-panel="advanced" role="tabpanel" hidden>
         <!-- Prompt filter -->
         <div class="card">
           <div class="card-header"><span class="card-title" data-i18n="settings.promptFilter"></span></div>
@@ -411,6 +534,86 @@
         <div class="card">
           <div class="card-header"><span class="card-title" data-i18n="settings.statistics"></span></div>
           <button class="btn btn-danger" id="resetStatsBtn" data-i18n="settings.resetStats"></button>
+        </div>
+        </div>
+      </div>
+
+      <!-- Metrics tab -->
+      <div id="tabMetrics" class="tab-content hidden">
+        <div class="metrics-toolbar card">
+          <div>
+            <div class="card-title" data-i18n="metrics.title"></div>
+            <p class="metrics-subtitle" data-i18n="metrics.subtitle"></p>
+          </div>
+          <div class="metrics-actions">
+            <select id="metricsRangeSelect" class="metrics-select" data-i18n-aria-label="metrics.range">
+              <option value="1h" data-i18n="metrics.range1h"></option>
+              <option value="6h" data-i18n="metrics.range6h"></option>
+              <option value="24h" selected data-i18n="metrics.range24h"></option>
+              <option value="7d" data-i18n="metrics.range7d"></option>
+              <option value="30d" data-i18n="metrics.range30d"></option>
+            </select>
+            <button class="btn btn-outline btn-sm" id="metricsRefreshBtn"><i class="fa-solid fa-rotate"></i><span
+                data-i18n="metrics.refresh"></span></button>
+          </div>
+        </div>
+
+        <div class="metrics-grid">
+          <div class="metric-card">
+            <div class="metric-label" data-i18n="metrics.totalTokens"></div>
+            <div class="metric-value" id="metricTotalTokens">0</div>
+            <div class="metric-sub"><span id="metricInputTokens">0</span> / <span id="metricOutputTokens">0</span>
+              <span data-i18n="metrics.inOut"></span></div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-label" data-i18n="metrics.requests"></div>
+            <div class="metric-value" id="metricRequests">0</div>
+            <div class="metric-sub"><span id="metricSuccessRate">0%</span> <span data-i18n="metrics.successRate"></span></div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-label" data-i18n="metrics.failures"></div>
+            <div class="metric-value metric-danger" id="metricFailures">0</div>
+            <div class="metric-sub"><span id="metricErrors429">0</span> <span data-i18n="metrics.errors429"></span></div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-label" data-i18n="metrics.latency"></div>
+            <div class="metric-value" id="metricLatency">0ms</div>
+            <div class="metric-sub"><span id="metricQueue">0</span> <span data-i18n="metrics.queueEvents"></span></div>
+          </div>
+        </div>
+
+        <div class="chart-grid">
+          <div class="card chart-card">
+            <div class="chart-title" data-i18n="metrics.tokensChart"></div>
+            <div id="tokensChart" class="metric-chart"></div>
+          </div>
+          <div class="card chart-card">
+            <div class="chart-title" data-i18n="metrics.requestsChart"></div>
+            <div id="requestsChart" class="metric-chart"></div>
+          </div>
+          <div class="card chart-card">
+            <div class="chart-title" data-i18n="metrics.errorsChart"></div>
+            <div id="errorsChart" class="metric-chart"></div>
+          </div>
+          <div class="card chart-card">
+            <div class="chart-title" data-i18n="metrics.latencyChart"></div>
+            <div id="latencyChart" class="metric-chart"></div>
+          </div>
+        </div>
+
+        <div class="top-grid">
+          <div class="card top-card">
+            <div class="chart-title" data-i18n="metrics.topModels"></div>
+            <div id="topModels" class="top-list"></div>
+          </div>
+          <div class="card top-card">
+            <div class="chart-title" data-i18n="metrics.topAccounts"></div>
+            <div id="topAccounts" class="top-list"></div>
+          </div>
+          <div class="card top-card">
+            <div class="chart-title" data-i18n="metrics.topApiKeys"></div>
+            <div id="topApiKeys" class="top-list"></div>
+          </div>
         </div>
       </div>
 

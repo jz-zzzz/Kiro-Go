@@ -17,7 +17,12 @@
   const selectedAccounts = new Set();
   let filterKeyword = '';
   let filterStatus = 'all';
+  let filterTier = 'all';
+  let filterProxy = 'all';
+  let filterSort = 'health';
+  let accountsViewMode = localStorage.getItem('accountsViewMode') === 'list' ? 'list' : 'card';
   let privacyModeEnabled = true;
+  let selectedBalanceMode = 'health';
   let promptRules = [];
   let builderIdSession = '';
   let builderIdPollTimer = null;
@@ -33,6 +38,9 @@
   let customSelectUid = 0;
   let customSelectObserver = null;
   let customSelectRefreshQueued = false;
+  let metricsRange = localStorage.getItem('metricsRange') || '24h';
+  let lastMetrics = null;
+  let currentSettingsTab = localStorage.getItem('settingsSubtab') || 'access';
 
   // DOM helpers
   const $ = (id) => document.getElementById(id);
@@ -114,6 +122,7 @@
     renderVersionBadge();
     renderAccounts();
     renderPromptRules();
+    if (lastMetrics) renderMetrics(lastMetrics);
   }
   function updateLangButtons() {
     qsa('.lang-btn').forEach(btn => btn.classList.toggle('active', btn.dataset.lang === currentLang));
@@ -259,7 +268,7 @@
     const wrap = document.createElement('div');
     wrap.className = 'custom-select';
     wrap.dataset.customSelect = 'true';
-    if (select.id === 'filterStatusSelect') wrap.classList.add('custom-select-filter');
+    if (select.id && select.id.startsWith('filter')) wrap.classList.add('custom-select-filter');
 
     const trigger = document.createElement('button');
     trigger.type = 'button';
@@ -428,6 +437,14 @@
     try { console.warn('[toast missing]', variant, msg); } catch (_) { }
     return function () {};
   };
+  function updateToast(dismiss, msg) {
+    if (dismiss && typeof dismiss.update === 'function') {
+      dismiss.update(msg);
+      return dismiss;
+    }
+    if (typeof dismiss === 'function') dismiss();
+    return toast(msg, 'info', { duration: 0 });
+  }
   const toastPrimary = (msg, opts) => toast(msg, 'primary', opts);
   const toastWarning = (msg, opts) => toast(msg, 'warning', opts);
   const toastError = (msg, opts) => toast(msg, 'error', opts);
@@ -644,7 +661,7 @@
 
   // Data loaders
   async function loadData() {
-    await Promise.all([loadStats(), loadAccounts(), loadSettings(), loadVersion()]);
+    await Promise.all([loadStats(), loadAccounts(), loadSettings(), loadVersion(), loadMetrics()]);
     renderEndpointCode('claudeEndpoint', baseUrl + '/v1/messages');
     renderEndpointCode('openaiEndpoint', baseUrl + '/v1/chat/completions');
     renderEndpointCode('openaiResponsesEndpoint', baseUrl + '/v1/responses');
@@ -668,22 +685,304 @@
     renderAccounts();
   }
 
+  function getMetricsRange() {
+    const select = $('metricsRangeSelect');
+    return (select && select.value) || metricsRange || '24h';
+  }
+  function metricsBucketForRange(range) {
+    if (range === '1h') return '1m';
+    if (range === '6h') return '5m';
+    if (range === '7d') return '1h';
+    if (range === '30d') return '6h';
+    return '15m';
+  }
+  async function loadMetrics() {
+    const range = getMetricsRange();
+    metricsRange = range;
+    localStorage.setItem('metricsRange', range);
+    const bucket = metricsBucketForRange(range);
+    const [summaryRes, tokensRes, requestsRes, errorsRes, latencyRes, modelsRes, accountsRes, keysRes] = await Promise.all([
+      api('/metrics/summary?range=' + encodeURIComponent(range)),
+      api('/metrics/timeseries?range=' + encodeURIComponent(range) + '&bucket=' + encodeURIComponent(bucket) + '&metric=tokens'),
+      api('/metrics/timeseries?range=' + encodeURIComponent(range) + '&bucket=' + encodeURIComponent(bucket) + '&metric=requests'),
+      api('/metrics/timeseries?range=' + encodeURIComponent(range) + '&bucket=' + encodeURIComponent(bucket) + '&metric=429'),
+      api('/metrics/timeseries?range=' + encodeURIComponent(range) + '&bucket=' + encodeURIComponent(bucket) + '&metric=latency'),
+      api('/metrics/top?range=' + encodeURIComponent(range) + '&groupBy=model&metric=tokens&limit=8'),
+      api('/metrics/top?range=' + encodeURIComponent(range) + '&groupBy=account&metric=tokens&limit=8'),
+      api('/metrics/top?range=' + encodeURIComponent(range) + '&groupBy=apiKey&metric=tokens&limit=8')
+    ]);
+    lastMetrics = {
+      summary: await summaryRes.json(),
+      tokens: await tokensRes.json(),
+      requests: await requestsRes.json(),
+      errors: await errorsRes.json(),
+      latency: await latencyRes.json(),
+      models: await modelsRes.json(),
+      accounts: await accountsRes.json(),
+      keys: await keysRes.json()
+    };
+    renderMetrics(lastMetrics);
+  }
+  function renderMetrics(data) {
+    if (!data || !data.summary) return;
+    const s = data.summary;
+    setText('metricTotalTokens', formatNum(Number(s.totalTokens || 0)));
+    setText('metricInputTokens', formatNum(Number(s.inputTokens || 0)));
+    setText('metricOutputTokens', formatNum(Number(s.outputTokens || 0)));
+    setText('metricRequests', formatNum(Number(s.requests || 0)));
+    setText('metricSuccessRate', ((Number(s.successRate || 0) * 100).toFixed(Number(s.requests || 0) ? 1 : 0)) + '%');
+    setText('metricFailures', formatNum(Number(s.failed || 0)));
+    setText('metricErrors429', formatNum(Number(s.errors429 || 0)));
+    setText('metricLatency', formatDurationMs(Number(s.avgLatencyMs || 0)));
+    setText('metricQueue', formatNum(Number(s.queueFull || 0) + Number(s.queueTimeout || 0)));
+    drawLineChart('tokensChart', data.tokens, '#60a5fa');
+    drawLineChart('requestsChart', data.requests, '#34d399');
+    drawLineChart('errorsChart', data.errors, '#fb7185');
+    drawLineChart('latencyChart', data.latency, '#fbbf24', 'ms');
+    renderTopList('topModels', data.models && data.models.items);
+    renderTopList('topAccounts', data.accounts && data.accounts.items);
+    renderTopList('topApiKeys', data.keys && data.keys.items);
+  }
+  function setText(id, value) {
+    const el = $(id);
+    if (el) el.textContent = value;
+  }
+  function formatDurationMs(ms) {
+    if (!ms) return '0ms';
+    if (ms >= 1000) return (ms / 1000).toFixed(ms >= 10000 ? 1 : 2) + 's';
+    return Math.round(ms) + 'ms';
+  }
+  function drawLineChart(id, series, color, suffix) {
+    const el = $(id);
+    if (!el) return;
+    const points = (series && series.points || []).map(p => ({ t: Number(p.t || 0), v: Number(p.value || 0) }));
+    const w = Math.max(320, el.clientWidth || 640);
+    const h = 190;
+    const pad = { l: 44, r: 14, t: 16, b: 28 };
+    const maxV = Math.max(1, ...points.map(p => p.v));
+    const minT = points.length ? points[0].t : 0;
+    const maxT = points.length ? points[points.length - 1].t : minT + 1;
+    const x = (t) => pad.l + ((t - minT) / Math.max(1, maxT - minT)) * (w - pad.l - pad.r);
+    const y = (v) => h - pad.b - (v / maxV) * (h - pad.t - pad.b);
+    const path = points.map((p, i) => (i ? 'L' : 'M') + x(p.t).toFixed(1) + ' ' + y(p.v).toFixed(1)).join(' ');
+    const area = path ? path + ' L ' + x(maxT).toFixed(1) + ' ' + (h - pad.b) + ' L ' + x(minT).toFixed(1) + ' ' + (h - pad.b) + ' Z' : '';
+    const grid = [0, 0.25, 0.5, 0.75, 1].map(r => {
+      const gy = pad.t + r * (h - pad.t - pad.b);
+      const label = compactMetric(maxV * (1 - r), suffix);
+      return '<line x1="' + pad.l + '" y1="' + gy.toFixed(1) + '" x2="' + (w - pad.r) + '" y2="' + gy.toFixed(1) + '" class="chart-grid-line" />' +
+        '<text x="' + (pad.l - 8) + '" y="' + (gy + 4).toFixed(1) + '" class="chart-axis-label" text-anchor="end">' + escapeHtml(label) + '</text>';
+    }).join('');
+    el.innerHTML = '<svg viewBox="0 0 ' + w + ' ' + h + '" role="img" aria-label="metric chart">' +
+      grid +
+      '<path d="' + area + '" class="chart-area" style="fill:' + color + '"></path>' +
+      '<path d="' + path + '" class="chart-line" style="stroke:' + color + '"></path>' +
+      '</svg>';
+  }
+  function compactMetric(v, suffix) {
+    const n = Number(v || 0);
+    const unit = suffix || '';
+    if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M' + unit;
+    if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K' + unit;
+    return Math.round(n).toString() + unit;
+  }
+  function renderTopList(id, items) {
+    const el = $(id);
+    if (!el) return;
+    const list = Array.isArray(items) ? items : [];
+    if (!list.length) {
+      el.innerHTML = '<div class="empty-state">' + escapeHtml(t('metrics.noData')) + '</div>';
+      return;
+    }
+    const maxTokens = Math.max(1, ...list.map(item => Number(item.totalTokens || 0)));
+    el.innerHTML = list.map(item => {
+      const tokens = Number(item.totalTokens || 0);
+      const pct = Math.max(4, Math.min(100, tokens / maxTokens * 100));
+      const label = item.label || item.key || t('metrics.unknown');
+      return '<div class="top-row">' +
+        '<div class="top-row-main"><span class="top-label" title="' + escapeAttr(label) + '">' + escapeHtml(label) + '</span>' +
+        '<span class="top-meta">' + formatNum(tokens) + ' ' + escapeHtml(t('stats.tokens')) + ' · ' + formatNum(Number(item.requests || 0)) + ' ' + escapeHtml(t('stats.requests')) + '</span></div>' +
+        '<div class="top-bar"><span style="width:' + pct.toFixed(1) + '%"></span></div>' +
+        '</div>';
+    }).join('');
+  }
+
   // Account list
+  function isAuto429Quarantine(a) {
+    return a.banReason === 'AUTO_QUARANTINE_SUSPICIOUS_429';
+  }
+  function isAuthDisabled(a) {
+    const reason = String(a && a.banReason || '').toLowerCase();
+    return !!(a && a.banStatus && a.banStatus !== 'ACTIVE' && !isAuto429Quarantine(a) && (
+      reason.includes('authentication failed') ||
+      reason.includes('bad credentials') ||
+      reason.includes('refresh failed: 401') ||
+      reason.includes('refresh failed: 403') ||
+      reason.includes('token invalid') ||
+      reason.includes('token expired') ||
+      reason.includes('unauthorized') ||
+      reason.includes('forbidden') ||
+      reason.includes('invalid_grant') ||
+      reason.includes('access token expired') ||
+      reason.includes('refresh token expired') ||
+      reason.includes('http 401') ||
+      reason.includes('http 403')
+    ));
+  }
+  function is429Cooling(a) {
+    return isAuto429Quarantine(a);
+  }
+  function isRecent429(a) {
+    return !is429Cooling(a) && Number(a && a.recent429Rate || 0) > 0;
+  }
+  function is429Limited(a) {
+    return is429Cooling(a);
+  }
+  function isAccountBanned(a) {
+    return !!(a && a.banStatus === 'BANNED' && !isAuto429Quarantine(a) && !isAuthDisabled(a));
+  }
+  function isAccountUnavailable(a) {
+    return !!(a && a.banStatus === 'SUSPENDED' && !isAuto429Quarantine(a) && !isAuthDisabled(a));
+  }
+  function isTokenIssue(a) {
+    return !hasTestCredentials(a) || !!(a.expiresAt && a.expiresAt < Date.now() / 1000 && !a.hasRefreshToken);
+  }
+  function isCooling(a) {
+    return !!(a.coolingUntil && a.coolingUntil > Date.now() / 1000);
+  }
+  function isQuotaRisk(a) {
+    return is429Cooling(a);
+  }
+  function isBlocked(a) {
+    return a.canRoute === false;
+  }
+  function isReady(a) {
+    return !!(a.enabled && !isAccountBanned(a) && !isAuthDisabled(a) && !isAccountUnavailable(a) && !isTokenIssue(a) && !isCooling(a) && !isBlocked(a) && !isRecent429(a));
+  }
+  function hasTestCredentials(a) {
+    return !!(a.hasToken || a.hasRefreshToken);
+  }
+  function isBatchTestEligible(a) {
+    return hasTestCredentials(a);
+  }
+  function accountTierKey(a) {
+    const s = String(a.subscriptionType || a.subscriptionTitle || '').toUpperCase();
+    if (s.includes('POWER')) return 'power';
+    if (s.includes('PRO_PLUS') || s.includes('PROPLUS')) return 'proplus';
+    if (s.includes('PRO')) return 'pro';
+    return 'free';
+  }
+  function accountMatchesStatus(a) {
+    if (filterStatus === 'all') return true;
+    if (filterStatus === 'ready') return isReady(a);
+    if (filterStatus === 'cooling') return isCooling(a) && !is429Cooling(a);
+    if (filterStatus === 'quota') return isQuotaRisk(a);
+    if (filterStatus === 'recent429') return isRecent429(a);
+    if (filterStatus === 'auth') return isAuthDisabled(a);
+    if (filterStatus === 'blocked') return isBlocked(a);
+    if (filterStatus === 'token') return isTokenIssue(a);
+    if (filterStatus === 'disabled') return !a.enabled && !isAccountBanned(a) && !isAuthDisabled(a) && !isAccountUnavailable(a) && !isAuto429Quarantine(a);
+    if (filterStatus === 'banned') return isAccountBanned(a);
+    return true;
+  }
+  function accountMatchesProxy(a) {
+    if (filterProxy === 'all') return true;
+    const dedicated = !!(a.proxyURL && String(a.proxyURL).trim());
+    return filterProxy === 'dedicated' ? dedicated : !dedicated;
+  }
+  function accountSearchText(a) {
+    return [a.email, a.id, a.subscriptionType, a.subscriptionTitle, a.provider, a.authMethod, a.proxyURL, a.banReason]
+      .filter(Boolean).join(' ').toLowerCase();
+  }
+  function accountStatusRank(a) {
+    if (isReady(a)) return 0;
+    if (isRecent429(a)) return 10;
+    if (is429Cooling(a)) return 20;
+    if (isCooling(a)) return 30;
+    if (isBlocked(a) && a.enabled) return 40;
+    if (isTokenIssue(a) && a.enabled) return 50;
+    if (isAuthDisabled(a)) return 60;
+    if (isAccountUnavailable(a)) return 70;
+    if (isAccountBanned(a)) return 80;
+    if (!a.enabled) return 90;
+    if (isTokenIssue(a)) return 95;
+    if (isBlocked(a)) return 100;
+    return 45;
+  }
+  function getHealthSortValue(a) {
+    const score = Number(a && a.healthScore);
+    if (!Number.isFinite(score) || score <= 0) return -1000;
+    if (isBlocked(a) || isTokenIssue(a) || !a.enabled) return -1000 + score / 100;
+    return score;
+  }
+  function sortValue(a, mode) {
+    if (mode === 'quota') return (is429Cooling(a) ? 100000 : 0) + Number(a.recent429Rate || 0) * 1000;
+    if (mode === 'usage') return getDisplayUsagePct(a);
+    if (mode === 'error') return Number(a.lastErrorAt || 0);
+    if (mode === 'requests') return Number(a.requestCount || 0);
+    return getHealthSortValue(a);
+  }
   function getFilteredAccounts() {
-    return accountsData.filter(a => {
-      if (filterStatus === 'enabled' && !a.enabled) return false;
-      if (filterStatus === 'disabled' && (a.enabled || (a.banStatus && a.banStatus !== 'ACTIVE'))) return false;
-      if (filterStatus === 'banned' && (!a.banStatus || a.banStatus === 'ACTIVE')) return false;
-      if (filterKeyword) {
-        const kw = filterKeyword.toLowerCase();
-        if (!(a.email || '').toLowerCase().includes(kw)) return false;
-      }
+    const kw = filterKeyword.trim().toLowerCase();
+    const list = accountsData.filter(a => {
+      if (!accountMatchesStatus(a)) return false;
+      if (filterTier !== 'all' && accountTierKey(a) !== filterTier) return false;
+      if (!accountMatchesProxy(a)) return false;
+      if (kw && !accountSearchText(a).includes(kw)) return false;
       return true;
     });
+    return list.sort((a, b) => {
+      if (filterSort === 'health') {
+        const ar = accountStatusRank(a);
+        const br = accountStatusRank(b);
+        if (ar !== br) return ar - br;
+      }
+      const av = sortValue(a, filterSort);
+      const bv = sortValue(b, filterSort);
+      if (bv !== av) return bv - av;
+      return String(a.email || '').localeCompare(String(b.email || ''));
+    });
+  }
+  function renderAccountsSummary() {
+    const el = $('accountsSummary');
+    if (!el) return;
+    const total = accountsData.length;
+    const ready = accountsData.filter(isReady).length;
+    const quota = accountsData.filter(isQuotaRisk).length;
+    const recent429 = accountsData.filter(isRecent429).length;
+    const auth = accountsData.filter(isAuthDisabled).length;
+    const disabled = accountsData.filter(a => !a.enabled && !isAccountBanned(a) && !isAuthDisabled(a) && !isAccountUnavailable(a) && !isAuto429Quarantine(a)).length;
+    const blocked = accountsData.filter(isBlocked).length;
+    const items = [
+      ['total', t('accounts.summaryTotal'), total],
+      ['ready', t('accounts.summaryReady'), ready],
+      ['quota', t('accounts.summaryQuotaCooling'), quota],
+      ['recent429', t('accounts.summaryRecent429'), recent429],
+      ['auth', t('accounts.summaryAuthDisabled'), auth],
+      ['blocked', t('accounts.summaryBlocked'), blocked],
+      ['disabled', t('accounts.summaryDisabled'), disabled],
+    ];
+    el.innerHTML = items.map(([kind, label, value]) =>
+      '<button class="summary-pill summary-' + kind + '" type="button" data-summary-filter="' + kind + '">' +
+      '<span>' + escapeHtml(label) + '</span>' +
+      '<strong>' + escapeHtml(value) + '</strong>' +
+      '</button>'
+    ).join('');
   }
   function onFilterChange() {
-    filterKeyword = $('filterSearch').value;
-    filterStatus = $('filterStatusSelect').value;
+    filterKeyword = ($('filterSearch') && $('filterSearch').value) || '';
+    filterStatus = ($('filterStatusSelect') && $('filterStatusSelect').value) || 'all';
+    filterTier = ($('filterTierSelect') && $('filterTierSelect').value) || 'all';
+    filterProxy = ($('filterProxySelect') && $('filterProxySelect').value) || 'all';
+    filterSort = ($('filterSortSelect') && $('filterSortSelect').value) || 'health';
+    renderAccounts();
+  }
+  function setStatusFilter(value) {
+    const select = $('filterStatusSelect');
+    if (select) {
+      select.value = value;
+      syncCustomSelect(select);
+    }
+    filterStatus = value;
     renderAccounts();
   }
   function toggleSelectAll(checked) {
@@ -756,25 +1055,29 @@
     if (normalized === 'google') return t('local.providerGoogle');
     return method;
   }
-  function getStatusBadge(a) {
-    const out = [];
-    const isBanned = a.banStatus && a.banStatus !== 'ACTIVE';
-    if (isBanned) {
-      if (a.banStatus === 'BANNED') out.push('<span class="badge badge-banned">' + escapeHtml(t('accounts.banned')) + '</span>');
-      else if (a.banStatus === 'SUSPENDED') out.push('<span class="badge badge-suspended">' + escapeHtml(t('accounts.suspended')) + '</span>');
-      out.push('<span class="badge badge-warning">' + escapeHtml(t('accounts.disabled')) + '</span>');
-    } else {
-      if (!a.hasToken)
-        out.push('<span class="badge badge-error">' + escapeHtml(t('accounts.noToken')) + '</span>');
-      else if (a.expiresAt && a.expiresAt < Date.now() / 1000)
-        out.push('<span class="badge badge-warning">' + escapeHtml(t('accounts.expired')) + '</span>');
-      else
-        out.push('<span class="badge badge-success">' + escapeHtml(t('accounts.normal')) + '</span>');
-      out.push(a.enabled
-        ? '<span class="badge badge-info">' + escapeHtml(t('accounts.enabled')) + '</span>'
-        : '<span class="badge badge-warning">' + escapeHtml(t('accounts.disabled')) + '</span>');
+  function getPrimaryStatus(a) {
+    if (isAuthDisabled(a)) {
+      return { key: 'auth', label: t('accounts.authDisabledShort') };
     }
-    return out.join('');
+    if (isAccountBanned(a)) {
+      return { key: 'banned', label: t('accounts.bannedShort') };
+    }
+    if (isAccountUnavailable(a)) {
+      return { key: 'suspended', label: t('accounts.suspendedShort') };
+    }
+    if (is429Cooling(a)) {
+      return isCooling(a) ? { key: 'quota', label: t('accounts.quotaCoolingShort', formatRemaining(a.coolingUntil)) } : { key: 'quota', label: t('accounts.quotaRiskShort') };
+    }
+    if (!a.enabled) return { key: 'disabled', label: t('accounts.disabledShort') };
+    if (isTokenIssue(a)) return { key: 'token', label: t('accounts.tokenIssue') };
+    if (isCooling(a)) return { key: 'cooling', label: t('accounts.coolingShort', formatRemaining(a.coolingUntil)) };
+    if (isBlocked(a)) return { key: 'blocked', label: t('accounts.blockedShort') };
+    if (isRecent429(a)) return { key: 'recent429', label: t('accounts.recent429Short') };
+    return { key: 'ready', label: t('accounts.readyShort') };
+  }
+  function renderPrimaryStatus(a) {
+    const status = getPrimaryStatus(a);
+    return '<span class="account-primary-status status-' + escapeAttr(status.key) + '">' + escapeHtml(status.label) + '</span>';
   }
   function formatTokenExpiry(ts) {
     if (!ts) return '-';
@@ -784,10 +1087,178 @@
     if (diff < 86400) return Math.floor(diff / 3600) + t('time.hours');
     return Math.floor(diff / 86400) + t('time.days');
   }
+  function formatRemaining(ts) {
+    if (!ts) return '-';
+    const diff = Math.max(0, ts - Date.now() / 1000);
+    if (diff < 60) return '<1' + t('time.minutes');
+    if (diff < 3600) return Math.ceil(diff / 60) + t('time.minutes');
+    return Math.ceil(diff / 3600) + t('time.hours');
+  }
+  function formatPercent(value) {
+    const num = Number(value || 0) * 100;
+    if (!Number.isFinite(num)) return '0%';
+    return num >= 10 ? num.toFixed(0) + '%' : num.toFixed(1) + '%';
+  }
   function formatNum(n) {
     if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
     if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
     return n.toString();
+  }
+  function formatQuotaNum(n) {
+    const num = Number(n || 0);
+    if (!Number.isFinite(num)) return '0';
+    return num.toLocaleString('en-US', {
+      maximumFractionDigits: 1,
+      minimumFractionDigits: Number.isInteger(num) ? 0 : 1
+    });
+  }
+  function getUsagePct(used, limit, fallbackRatio) {
+    const usedNum = Number(used || 0);
+    const limitNum = Number(limit || 0);
+    if (Number.isFinite(usedNum) && Number.isFinite(limitNum) && limitNum > 0) {
+      return (usedNum / limitNum) * 100;
+    }
+    const pct = Number(fallbackRatio || 0) * 100;
+    return Number.isFinite(pct) ? pct : 0;
+  }
+  function getMainUsagePct(a) {
+    return getUsagePct(a.usageCurrent, a.usageLimit, a.usagePercent);
+  }
+  function getDisplayUsagePct(a) {
+    return getEffectiveUsageInfo(a).displayPct;
+  }
+  function getUsageClass(pct) {
+    const num = Number(pct || 0);
+    if (num >= 100) return 'critical';
+    if (num > 90) return 'critical';
+    if (num > 70) return 'high';
+    return '';
+  }
+  function isOverageEnabled(a) {
+    return String(a && a.overageStatus || '').toUpperCase() === 'ENABLED';
+  }
+  function isOverMainQuota(a) {
+    return Number(a && a.usageLimit || 0) > 0 && Number(a && a.usageCurrent || 0) > Number(a && a.usageLimit || 0);
+  }
+  function isOverageEffective(a) {
+    return Boolean(a && a.overageEffective) || isOverageEnabled(a) || isOverMainQuota(a);
+  }
+  function formatUsagePct(pct) {
+    const num = Number(pct || 0);
+    if (!Number.isFinite(num)) return '0%';
+    return num >= 10 ? num.toFixed(0) + '%' : num.toFixed(1) + '%';
+  }
+  function formatUsageQuota(used, limit) {
+    return formatQuotaNum(used) + ' / ' + formatQuotaNum(limit);
+  }
+  function formatPoints(value) {
+    return formatQuotaNum(value) + ' ' + t('accounts.pointsUnit');
+  }
+  function getOverageUsedPoints(a) {
+    const current = Math.max(0, Number(a && a.currentOverages || 0));
+    const fallback = Math.max(0, Number(a && a.usageCurrent || 0) - Number(a && a.usageLimit || 0));
+    return Math.max(current, fallback);
+  }
+  function getOverageCapPoints(a) {
+    const cap = Number(a && a.overageCap || 0);
+    return cap > 0 ? cap : 10000;
+  }
+  function formatMoney(value) {
+    const num = Number(value || 0);
+    if (!Number.isFinite(num)) return '$0';
+    return '$' + num.toFixed(num >= 1 ? 2 : 4);
+  }
+  function getEffectiveUsageInfo(a) {
+    const limit = Number(a && a.usageLimit || 0);
+    if (!(limit > 0)) {
+      return { visible: false, pct: 0, displayPct: 0, barPct: 0, text: '-', title: '-', className: '' };
+    }
+    const used = Number(a && a.usageCurrent || 0);
+    const overageUsed = getOverageUsedPoints(a);
+    if (isOverageEffective(a) && (used > limit || overageUsed > 0)) {
+      const cap = getOverageCapPoints(a);
+      const totalLimit = limit + cap;
+      const pct = totalLimit > 0 ? (used / totalLimit) * 100 : 0;
+      const mainPct = getMainUsagePct(a);
+      const text = formatUsageQuota(used, totalLimit) + ' · ' + formatUsagePct(pct);
+      const title = t('accounts.totalQuota') + ' ' + text + ' · ' + t('accounts.mainQuota') + ' ' + formatUsageQuota(Math.min(used, limit), limit) + ' · ' + t('accounts.overageSpend', formatPoints(overageUsed), formatPoints(cap));
+      return {
+        visible: true,
+        label: t('accounts.totalQuota'),
+        pct,
+        mainPct,
+        displayPct: pct,
+        barPct: Math.min(100, pct),
+        text,
+        title,
+        className: getUsageClass(pct)
+      };
+    }
+    const pct = getMainUsagePct(a);
+    const text = formatUsageQuota(used, limit) + ' · ' + formatUsagePct(pct);
+    return {
+      visible: true,
+      label: t('accounts.mainQuota'),
+      pct,
+      displayPct: pct,
+      barPct: Math.min(100, pct),
+      text,
+      title: t('accounts.mainQuota') + ' ' + text,
+      className: getUsageClass(pct)
+    };
+  }
+  function getMainUsageInfo(a) {
+    const limit = Number(a.usageLimit || 0);
+    if (!(limit > 0)) {
+      return { visible: false, pct: 0, displayPct: 0, barPct: 0, text: '-', title: '-', className: '' };
+    }
+    const used = Number(a.usageCurrent || 0);
+    const pct = getMainUsagePct(a);
+    const overageOn = isOverageEffective(a);
+    const cappedPct = Math.min(100, pct);
+    const displayUsed = overageOn && used > limit ? limit : used;
+    const quotaText = formatUsageQuota(displayUsed, limit);
+    let text = quotaText + ' · ' + formatUsagePct(pct);
+    let title = t('accounts.mainQuota') + ' ' + text;
+    if (overageOn && used > limit) {
+      const overText = t('accounts.overageUsage');
+      const detailText = t('accounts.overageUsageDetail', formatUsageQuota(used, limit), formatQuotaNum(used - limit), formatUsagePct(cappedPct));
+      text = quotaText + ' · ' + overText;
+      title = t('accounts.mainQuota') + ' ' + quotaText + ' · ' + detailText;
+    }
+    return {
+      visible: true,
+      pct,
+      displayPct: overageOn ? cappedPct : pct,
+      barPct: cappedPct,
+      text,
+      title,
+      className: getUsageClass(overageOn ? cappedPct : pct)
+    };
+  }
+  function getOverageInfo(a) {
+    if (!isOverageEffective(a)) return null;
+    const current = getOverageUsedPoints(a);
+    const cap = getOverageCapPoints(a);
+    const rate = Number(a.overageRate || 0);
+    const pct = cap > 0 ? (current / cap) * 100 : 0;
+    const text = t('accounts.overageSpend', formatPoints(current), formatPoints(cap));
+    const title = rate > 0 ? text + ' · ' + t('accounts.overageRateValue', formatPoints(rate)) : text;
+    return {
+      pct,
+      barPct: cap > 0 ? Math.min(100, pct) : 100,
+      text,
+      title,
+      className: cap > 0 ? getUsageClass(pct) : 'high'
+    };
+  }
+  function renderUsageBar(label, info, extraClass) {
+    if (!info || info.visible === false) return '';
+    const pctValue = info.barPct != null ? info.barPct : info.displayPct;
+    return '<div class="account-usage account-usage-compact' + (extraClass ? ' ' + escapeAttr(extraClass) : '') + '">' +
+      '<div class="usage-text"><span>' + escapeHtml(label) + '</span><span>' + escapeHtml(info.text) + '</span></div>' +
+      '<div class="usage-bar" title="' + escapeAttr(info.title || info.text) + '"><div class="usage-fill ' + escapeAttr(info.className || '') + '" data-usage-pct="' + escapeAttr(pctValue) + '"></div></div>' +
+      '</div>';
   }
   function applyUsageBars(root) {
     qsa('.usage-fill[data-usage-pct]', root).forEach(el => {
@@ -795,84 +1266,173 @@
       el.style.width = pct + '%';
     });
   }
-
-  function renderAccounts() {
-    const container = $('accountsList');
-    if (!container) return;
-    const filtered = getFilteredAccounts();
-    if (filtered.length === 0) {
-      container.innerHTML = '<div class="empty-state">' + escapeHtml(t('accounts.empty')) + '</div>';
-      return;
-    }
-    container.innerHTML = filtered.map(a => {
-      const usagePct = (a.usagePercent || 0) * 100;
-      const usageClass = usagePct > 90 ? 'critical' : usagePct > 70 ? 'high' : '';
-      const trialPct = (a.trialUsagePercent || 0) * 100;
-      const trialClass = trialPct > 90 ? 'critical' : trialPct > 70 ? 'high' : '';
-      const isSelected = selectedAccounts.has(a.id);
-      const weight = a.weight || 0;
-      const weightBadge = weight >= 2 ? '<span class="badge badge-warning">' + escapeHtml(t('accounts.weightShort')) + ':' + weight + '</span>' : '';
-      const overageBadge = renderOverageBadge(a);
-      const banned = a.banStatus && a.banStatus !== 'ACTIVE';
-      const idAttr = escapeAttr(a.id);
-      const displayEmail = getDisplayEmail(a.email, a.id);
-      const selectLabel = t('accounts.selectAccount', displayEmail);
-
-      const refreshSvg = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M23 4v6h-6M1 20v-6h6"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>';
-      const userSvg = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>';
-      const copySvg = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>';
-
-      return '' +
-        '<div class="account-card' + (isSelected ? ' selected' : '') + '" data-id="' + idAttr + '">' +
-        '<div class="account-header">' +
-        '<div class="account-info">' +
-        '<input type="checkbox" class="account-checkbox" ' + (isSelected ? 'checked' : '') + ' data-id="' + idAttr + '" aria-label="' + escapeAttr(selectLabel) + '" />' +
-        '<div class="account-info-text">' +
-        '<div class="account-email">' + escapeHtml(displayEmail) + '</div>' +
-        '<div class="account-meta">' +
-        getSubBadge(a.subscriptionType) +
-        getTrialBadge(a) +
-        weightBadge +
-        overageBadge +
-        '<span class="badge badge-info">' + escapeHtml(formatAuthMethod(a.provider || a.authMethod)) + '</span>' +
-        getStatusBadge(a) +
-        '</div>' +
-        '</div>' +
-        '</div>' +
-        '<div class="account-actions">' +
+  function renderMetric(label, value, kind) {
+    return '<div class="metric-pill metric-' + escapeAttr(kind || 'default') + '">' +
+      '<span class="metric-label">' + escapeHtml(label) + '</span>' +
+      '<strong>' + escapeHtml(value) + '</strong>' +
+      '</div>';
+  }
+  function getAccountListViewData(a) {
+    const mainUsage = getEffectiveUsageInfo(a);
+    const overageUsage = getOverageInfo(a);
+    const trialPct = getUsagePct(a.trialUsageCurrent, a.trialUsageLimit, a.trialUsagePercent);
+    const trialUsage = a.trialUsageLimit > 0 ? {
+      visible: true,
+      text: formatUsageQuota(a.trialUsageCurrent, a.trialUsageLimit) + ' · ' + formatUsagePct(trialPct),
+      title: t('accounts.trialQuota') + ' ' + formatUsageQuota(a.trialUsageCurrent, a.trialUsageLimit) + ' · ' + formatUsagePct(trialPct),
+      barPct: Math.min(100, trialPct),
+      className: getUsageClass(trialPct)
+    } : null;
+    const displayEmail = getDisplayEmail(a.email, a.id);
+    const proxyLabel = a.proxyURL ? t('filter.proxyDedicated') : t('filter.proxyGlobal');
+    const healthScore = Number.isFinite(Number(a.healthScore)) ? Number(a.healthScore) : 0;
+    return { mainUsage, overageUsage, trialUsage, displayEmail, proxyLabel, healthScore };
+  }
+  function renderAccountActions(a, idAttr, banned, compact) {
+    const refreshSvg = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M23 4v6h-6M1 20v-6h6"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>';
+    const userSvg = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>';
+    const copySvg = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>';
+    const powerSvg = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v10"/><path d="M18.4 6.6a9 9 0 1 1-12.8 0"/></svg>';
+    const testSvg = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg>';
+    const deleteSvg = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>';
+    if (compact) {
+      return '<div class="account-actions account-actions-compact">' +
         '<button class="btn btn-icon btn-sm btn-ghost" data-action="refresh" data-id="' + idAttr + '" title="' + escapeAttr(t('accounts.refresh')) + '">' + refreshSvg + '</button>' +
         '<button class="btn btn-icon btn-sm btn-ghost" data-action="detail" data-id="' + idAttr + '" title="' + escapeAttr(t('accounts.detail')) + '">' + userSvg + '</button>' +
         '<button class="btn btn-icon btn-sm btn-ghost" data-action="copyJSON" data-id="' + idAttr + '" title="' + escapeAttr(t('accounts.copyJSON')) + '">' + copySvg + '</button>' +
-        (banned ? '' :
-          '<button class="btn btn-sm ' + (a.enabled ? 'btn-outline' : 'btn-primary') + '" data-action="toggle" data-id="' + idAttr + '" data-enabled="' + (!a.enabled) + '">' +
-          escapeHtml(a.enabled ? t('accounts.disable') : t('accounts.enable')) +
-          '</button>') +
-        '<button class="btn btn-sm btn-secondary" data-action="test" data-id="' + idAttr + '" id="test-' + idAttr + '">' + escapeHtml(t('accounts.test')) + '</button>' +
-        '<button class="btn btn-sm btn-danger" data-action="delete" data-id="' + idAttr + '">' + escapeHtml(t('accounts.delete')) + '</button>' +
+        (banned ? '' : '<button class="btn btn-icon btn-sm ' + (a.enabled ? 'btn-outline' : 'btn-primary') + '" data-action="toggle" data-id="' + idAttr + '" data-enabled="' + (!a.enabled) + '" title="' + escapeAttr(a.enabled ? t('accounts.disable') : t('accounts.enable')) + '">' + powerSvg + '</button>') +
+        '<button class="btn btn-icon btn-sm btn-secondary" data-action="test" data-id="' + idAttr + '" id="test-' + idAttr + '" title="' + escapeAttr(t('accounts.test')) + '">' + testSvg + '</button>' +
+        '<button class="btn btn-icon btn-sm btn-danger" data-action="delete" data-id="' + idAttr + '" title="' + escapeAttr(t('accounts.delete')) + '">' + deleteSvg + '</button>' +
+        '</div>';
+    }
+    return '<div class="account-actions">' +
+      '<button class="btn btn-icon btn-sm btn-ghost" data-action="refresh" data-id="' + idAttr + '" title="' + escapeAttr(t('accounts.refresh')) + '">' + refreshSvg + '</button>' +
+      '<button class="btn btn-icon btn-sm btn-ghost" data-action="detail" data-id="' + idAttr + '" title="' + escapeAttr(t('accounts.detail')) + '">' + userSvg + '</button>' +
+      '<button class="btn btn-icon btn-sm btn-ghost" data-action="copyJSON" data-id="' + idAttr + '" title="' + escapeAttr(t('accounts.copyJSON')) + '">' + copySvg + '</button>' +
+      (banned ? '' :
+        '<button class="btn btn-sm ' + (a.enabled ? 'btn-outline' : 'btn-primary') + '" data-action="toggle" data-id="' + idAttr + '" data-enabled="' + (!a.enabled) + '">' +
+        escapeHtml(a.enabled ? t('accounts.disable') : t('accounts.enable')) +
+        '</button>') +
+      '<button class="btn btn-sm btn-secondary" data-action="test" data-id="' + idAttr + '" id="test-' + idAttr + '">' + escapeHtml(t('accounts.test')) + '</button>' +
+      '<button class="btn btn-sm btn-danger" data-action="delete" data-id="' + idAttr + '">' + escapeHtml(t('accounts.delete')) + '</button>' +
+      '</div>';
+  }
+  function renderAccountsViewToggle() {
+    qsa('[data-view-mode]').forEach(btn => {
+      const active = btn.dataset.viewMode === accountsViewMode;
+      btn.classList.toggle('active', active);
+      btn.setAttribute('aria-pressed', String(active));
+    });
+  }
+  function setAccountsViewMode(mode) {
+    accountsViewMode = mode === 'list' ? 'list' : 'card';
+    localStorage.setItem('accountsViewMode', accountsViewMode);
+    renderAccountsViewToggle();
+    renderAccounts();
+  }
+  function renderAccountsListView(filtered) {
+    const rows = filtered.map(a => {
+      const data = getAccountListViewData(a);
+      const isSelected = selectedAccounts.has(a.id);
+      const banned = isAccountBanned(a);
+      const idAttr = escapeAttr(a.id);
+      const selectLabel = t('accounts.selectAccount', data.displayEmail);
+      const tier = formatSubscriptionLabel(a.subscriptionType);
+      const usageText = data.mainUsage.visible ? data.mainUsage.text : '-';
+      const usageTitle = data.mainUsage.visible ? data.mainUsage.title : '-';
+      const overageText = data.overageUsage ? '<span class="account-list-trial account-list-overage">' + escapeHtml(data.overageUsage.text) + '</span>' : '';
+      const trialText = data.trialUsage ? '<span class="account-list-trial">' + escapeHtml(t('accounts.trialQuota') + ' ' + data.trialUsage.text) + '</span>' : '';
+      return '<div class="account-list-row' + (isSelected ? ' selected' : '') + '" data-id="' + idAttr + '">' +
+        '<div class="account-list-cell account-list-check"><input type="checkbox" class="account-checkbox" ' + (isSelected ? 'checked' : '') + ' data-id="' + idAttr + '" aria-label="' + escapeAttr(selectLabel) + '" /></div>' +
+        '<div class="account-list-cell account-list-identity"><div class="account-title-row"><span class="account-email">' + escapeHtml(data.displayEmail) + '</span>' + renderPrimaryStatus(a) + '</div><div class="account-meta-line"><span>' + escapeHtml(tier) + '</span><span>' + escapeHtml(formatAuthMethod(a.provider || a.authMethod)) + '</span></div></div>' +
+        '<div class="account-list-cell account-list-status"><span class="list-cell-label">' + escapeHtml(t('accounts.health')) + '</span><strong>' + escapeHtml(data.healthScore || '-') + '</strong></div>' +
+        '<div class="account-list-cell account-list-429"><span class="list-cell-label">' + escapeHtml(t('accounts.rate429')) + '</span><strong class="' + (Number(a.recent429Rate || 0) > 0 ? 'text-danger' : 'text-success') + '">' + escapeHtml(formatPercent(a.recent429Rate)) + '</strong></div>' +
+        '<div class="account-list-cell account-list-usage" title="' + escapeAttr(usageTitle) + '"><span class="list-cell-label">' + escapeHtml(t('accounts.usage')) + '</span><strong>' + escapeHtml(usageText) + '</strong>' + overageText + trialText + (data.mainUsage.visible ? '<div class="usage-bar list-usage-bar"><div class="usage-fill ' + escapeAttr(data.mainUsage.className) + '" data-usage-pct="' + escapeAttr(data.mainUsage.barPct) + '"></div></div>' : '') + '</div>' +
+        '<div class="account-list-cell account-list-requests"><span class="list-cell-label">' + escapeHtml(t('accounts.requests')) + '</span><strong>' + escapeHtml(a.requestCount || 0) + '</strong></div>' +
+        '<div class="account-list-cell account-list-proxy"><span class="list-cell-label">' + escapeHtml(t('filter.proxy')) + '</span><strong>' + escapeHtml(data.proxyLabel) + '</strong></div>' +
+        '<div class="account-list-cell account-list-actions">' + renderAccountActions(a, idAttr, banned, true) + '</div>' +
+        '</div>';
+    }).join('');
+    return '<div class="account-list-view">' +
+      '<div class="account-list-head"><span></span><span>' + escapeHtml(t('accounts.account')) + '</span><span>' + escapeHtml(t('accounts.health')) + '</span><span>' + escapeHtml(t('accounts.rate429')) + '</span><span>' + escapeHtml(t('accounts.usage')) + '</span><span>' + escapeHtml(t('accounts.requests')) + '</span><span>' + escapeHtml(t('filter.proxy')) + '</span><span>' + escapeHtml(t('accounts.actions')) + '</span></div>' +
+      rows +
+      '</div>';
+  }
+  function renderAccounts() {
+    const container = $('accountsList');
+    if (!container) return;
+    renderAccountsSummary();
+    const filtered = getFilteredAccounts();
+    renderAccountsViewToggle();
+    if (filtered.length === 0) {
+      container.innerHTML = '<div class="empty-state">' + escapeHtml(t('accounts.empty')) + '</div>';
+      updateBatchBar();
+      return;
+    }
+    if (accountsViewMode === 'list') {
+      container.innerHTML = renderAccountsListView(filtered);
+      applyUsageBars(container);
+      updateBatchBar();
+      return;
+    }
+    container.innerHTML = filtered.map(a => {
+      const mainUsage = getEffectiveUsageInfo(a);
+      const overageUsage = getOverageInfo(a);
+      const trialPct = getUsagePct(a.trialUsageCurrent, a.trialUsageLimit, a.trialUsagePercent);
+      const trialUsage = a.trialUsageLimit > 0 ? {
+        visible: true,
+        text: formatUsageQuota(a.trialUsageCurrent, a.trialUsageLimit) + ' · ' + formatUsagePct(trialPct),
+        title: t('accounts.trialQuota') + ' ' + formatUsageQuota(a.trialUsageCurrent, a.trialUsageLimit) + ' · ' + formatUsagePct(trialPct),
+        barPct: Math.min(100, trialPct),
+        className: getUsageClass(trialPct)
+      } : null;
+      const isSelected = selectedAccounts.has(a.id);
+      const banned = isAccountBanned(a);
+      const idAttr = escapeAttr(a.id);
+      const displayEmail = getDisplayEmail(a.email, a.id);
+      const selectLabel = t('accounts.selectAccount', displayEmail);
+      const proxyLabel = a.proxyURL ? t('filter.proxyDedicated') : t('filter.proxyGlobal');
+      const healthScore = Number.isFinite(Number(a.healthScore)) ? Number(a.healthScore) : 0;
+      const metrics = renderMetric(t('accounts.health'), healthScore || '-', 'health') +
+        renderMetric(t('accounts.rate429'), formatPercent(a.recent429Rate), Number(a.recent429Rate || 0) > 0 ? 'danger' : 'ok') +
+        renderMetric(t('accounts.usage'), mainUsage.visible ? mainUsage.text : '-', mainUsage.className === 'critical' ? 'danger' : mainUsage.className === 'high' ? 'warn' : 'ok') +
+        renderMetric(t('accounts.expiry'), formatTokenExpiry(a.expiresAt), isTokenIssue(a) ? 'danger' : 'default');
+      const secondary = [
+        getTrialBadge(a),
+        renderOverageBadge(a),
+        a.weight >= 2 ? '<span class="subtle-chip">' + escapeHtml(t('accounts.weightShort')) + ' ' + escapeHtml(a.weight) + '</span>' : '',
+        a.modeBucket ? '<span class="subtle-chip">' + escapeHtml(t('accounts.poolBucket')) + ' ' + escapeHtml(a.modeBucket) + '</span>' : '',
+        '<span class="subtle-chip">' + escapeHtml(t('accounts.requests')) + ' ' + escapeHtml(a.requestCount || 0) + '</span>',
+        '<span class="subtle-chip">' + escapeHtml(t('accounts.tokens')) + ' ' + escapeHtml(formatNum(a.totalTokens || 0)) + '</span>',
+        '<span class="subtle-chip">' + escapeHtml(t('accounts.credits')) + ' ' + escapeHtml((a.totalCredits || 0).toFixed(1)) + '</span>'
+      ].filter(Boolean).join('');
+
+      return '' +
+        '<div class="account-card account-card-compact' + (isSelected ? ' selected' : '') + '" data-id="' + idAttr + '">' +
+        '<div class="account-main-row">' +
+        '<div class="account-info">' +
+        '<input type="checkbox" class="account-checkbox" ' + (isSelected ? 'checked' : '') + ' data-id="' + idAttr + '" aria-label="' + escapeAttr(selectLabel) + '" />' +
+        '<div class="account-info-text">' +
+        '<div class="account-title-row"><span class="account-email">' + escapeHtml(displayEmail) + '</span>' + renderPrimaryStatus(a) + '</div>' +
+        '<div class="account-meta-line">' +
+        '<span>' + escapeHtml(formatSubscriptionLabel(a.subscriptionType)) + '</span>' +
+        '<span>' + escapeHtml(formatAuthMethod(a.provider || a.authMethod)) + '</span>' +
+        '<span>' + escapeHtml(proxyLabel) + '</span>' +
         '</div>' +
         '</div>' +
-        (a.usageLimit > 0 ?
-          '<div class="account-usage">' +
-          '<div class="usage-label">' + escapeHtml(t('accounts.mainQuota')) + '</div>' +
-          '<div class="usage-bar"><div class="usage-fill ' + usageClass + '" data-usage-pct="' + escapeAttr(usagePct) + '"></div></div>' +
-          '<div class="usage-text"><span>' + (a.usageCurrent != null ? a.usageCurrent.toFixed(1) : 0) + ' / ' + (a.usageLimit != null ? a.usageLimit.toFixed(0) : 0) + '</span><span>' + usagePct.toFixed(1) + '%</span></div>' +
-          '</div>' : '') +
-        (a.trialUsageLimit > 0 ?
-          '<div class="account-usage">' +
-          '<div class="usage-label">' + escapeHtml(t('accounts.trialQuota')) + ' ' + escapeHtml(formatTrialExpiry(a.trialExpiresAt)) + '</div>' +
-          '<div class="usage-bar"><div class="usage-fill ' + trialClass + '" data-usage-pct="' + escapeAttr(trialPct) + '"></div></div>' +
-          '<div class="usage-text"><span>' + (a.trialUsageCurrent != null ? a.trialUsageCurrent.toFixed(1) : 0) + ' / ' + (a.trialUsageLimit != null ? a.trialUsageLimit.toFixed(0) : 0) + '</span><span>' + trialPct.toFixed(1) + '%</span></div>' +
-          '</div>' : '') +
-        '<div class="account-stats">' +
-        '<div class="account-stat"><div class="account-stat-value">' + (a.requestCount || 0) + '</div><div class="account-stat-label">' + escapeHtml(t('accounts.requests')) + '</div></div>' +
-        '<div class="account-stat"><div class="account-stat-value">' + formatNum(a.totalTokens || 0) + '</div><div class="account-stat-label">' + escapeHtml(t('accounts.tokens')) + '</div></div>' +
-        '<div class="account-stat"><div class="account-stat-value">' + (a.totalCredits || 0).toFixed(1) + '</div><div class="account-stat-label">' + escapeHtml(t('accounts.credits')) + '</div></div>' +
-        '<div class="account-stat"><div class="account-stat-value">' + escapeHtml(formatTokenExpiry(a.expiresAt)) + '</div><div class="account-stat-label">' + escapeHtml(t('accounts.expiry')) + '</div></div>' +
         '</div>' +
+        renderAccountActions(a, idAttr, banned) +
+        '</div>' +
+        '<div class="account-metrics">' + metrics + '</div>' +
+        renderUsageBar(mainUsage.label || t('accounts.mainQuota'), mainUsage) +
+        renderUsageBar(t('accounts.overage'), overageUsage, 'overage') +
+        renderUsageBar(t('accounts.trialQuota'), trialUsage, 'trial') +
+        '<div class="account-secondary-row">' + secondary + '</div>' +
         '</div>';
     }).join('');
     applyUsageBars(container);
     enhanceCustomSelects(container);
+    updateBatchBar();
   }
 
   // Account actions
@@ -978,7 +1538,7 @@
     let ok = 0, fail = 0;
     for (const id of ids) {
       try {
-        const res = await api('/accounts/' + id + '/models/refresh', { method: 'POST' });
+        const res = await api('/accounts/' + encodeURIComponent(id) + '/models/refresh', { method: 'POST' });
         const d = await res.json();
         if (d.success) ok++; else fail++;
       } catch { fail++; }
@@ -988,6 +1548,58 @@
     selectedAccounts.clear();
     updateBatchBar();
     loadAccounts();
+  }
+  async function batchTestAuto() {
+    const selectedIds = Array.from(selectedAccounts);
+    if (!selectedIds.length) return;
+    const selected = selectedIds.map(id => accountsData.find(a => a.id === id)).filter(Boolean);
+    const eligible = selected.filter(isBatchTestEligible);
+    const skipped = selectedIds.length - eligible.length;
+    if (!eligible.length) {
+      toast(t('batch.noSafeTestTargets'), 'warning');
+      return;
+    }
+    const recoverable = eligible.filter(a => !a.enabled || isCooling(a) || Number(a.recent429Rate || 0) > 0 || isBlocked(a)).length;
+    const ids = eligible.map(a => a.id);
+    const confirmed = await confirmAction(t('batch.confirmTestAuto', ids.length, skipped, recoverable), {
+      title: t('batch.testAuto'),
+      confirmText: t('batch.testAuto')
+    });
+    if (!confirmed) return;
+    let dismiss = toast(t('batch.testingAuto', 0, ids.length), 'info', { duration: 0 });
+    let ok = 0, fail = 0;
+    const failures = [];
+    for (let i = 0; i < ids.length; i++) {
+      const id = ids[i];
+      try {
+        dismiss = updateToast(dismiss, t('batch.testingAuto', i + 1, ids.length));
+        const res = await api('/accounts/' + encodeURIComponent(id) + '/test', {
+          method: 'POST',
+          body: JSON.stringify({})
+        });
+        const d = await res.json().catch(() => ({}));
+        if (res.ok && d.success) {
+          ok++;
+        } else {
+          fail++;
+          failures.push({ id, error: d.error || ('HTTP ' + res.status) });
+        }
+      } catch (e) {
+        fail++;
+        failures.push({ id, error: (e && e.message) || String(e) });
+      }
+    }
+    dismiss();
+    const summary = skipped > 0 ? t('batch.testAutoResultSkipped', ok, fail, skipped) : t('batch.testAutoResult', ok, fail);
+    if (failures.length) {
+      console.warn('[batch auto test failures]', failures);
+      toast(summary + ' · ' + summarizeTestError(failures[0].error), 'warning', { duration: 8000 });
+    } else {
+      toast(summary, 'success');
+    }
+    selectedAccounts.clear();
+    updateBatchBar();
+    loadAccounts(); loadStats();
   }
   async function batchDelete() {
     const ids = Array.from(selectedAccounts);
@@ -1046,72 +1658,83 @@
 
   // Detail modal
   function detailItem(label, value) {
-    return '<div class="detail-item"><div class="detail-label">' + escapeHtml(label) + '</div><div class="detail-value">' + escapeHtml(value) + '</div></div>';
+    const text = value == null || value === '' ? '-' : String(value);
+    return '<div class="detail-item" title="' + escapeAttr(label + ': ' + text) + '"><span class="detail-label">' + escapeHtml(label) + '</span><span class="detail-value">' + escapeHtml(text) + '</span></div>';
+  }
+  function detailSection(title, content) {
+    return '<div class="detail-section"><h4>' + escapeHtml(title) + '</h4>' + content + '</div>';
+  }
+  function detailAccordion(title, content) {
+    return '<details class="detail-section detail-accordion"><summary><span>' + escapeHtml(title) + '</span></summary><div class="detail-accordion-content">' + content + '</div></details>';
+  }
+  function detailEditRow(label, content, hint) {
+    return '<div class="detail-edit-row"><div class="detail-edit-label">' + escapeHtml(label) + '</div><div class="detail-edit-content">' + content + (hint ? '<small>' + escapeHtml(hint) + '</small>' : '') + '</div></div>';
   }
   function showDetail(id) {
     const a = accountsData.find(x => x.id === id);
     if (!a) return;
     const idAttr = escapeAttr(id);
-    $('detailBody').innerHTML =
-      '<div class="detail-section"><h4>' + escapeHtml(t('detail.basicInfo')) + '</h4><div class="detail-grid">' +
-      detailItem(t('detail.email'), getDisplayEmail(a.email, null)) +
-      detailItem(t('detail.userId'), a.userId || '-') +
-      detailItem(t('detail.authMethod'), formatAuthMethod(a.provider || a.authMethod)) +
-      detailItem(t('detail.region'), a.region || 'us-east-1') +
-      '</div></div>' +
-
-      '<div class="detail-section"><h4>' + escapeHtml(t('detail.machineId')) + '</h4><div class="machine-id-row">' +
-      '<input type="text" id="machineIdInput" value="' + escapeAttr(a.machineId || '') + '" placeholder="UUID" />' +
-      '<button class="btn btn-sm btn-outline" id="generateMachineIdBtn" type="button">' + escapeHtml(t('detail.generate')) + '</button>' +
-      '<button class="btn btn-sm btn-primary" data-detail-action="saveMachineId" data-id="' + idAttr + '" type="button">' + escapeHtml(t('detail.save')) + '</button>' +
-      '</div></div>' +
-
-      '<div class="detail-section"><h4>' + escapeHtml(t('detail.weight')) + '</h4>' +
-      '<div class="form-group">' +
-      '<input type="number" id="weightInput" value="' + (a.weight || 0) + '" min="0" max="10" />' +
-      '<small>' + escapeHtml(t('detail.weightHint')) + '</small>' +
-      '</div>' +
-      '<button class="btn btn-sm btn-primary" data-detail-action="saveWeight" data-id="' + idAttr + '" type="button">' + escapeHtml(t('detail.save')) + '</button>' +
-      '</div>' +
-
-      '<div class="detail-section">' +
-      '<h4>' + escapeHtml(t('detail.overage')) +
-      ' <button class="btn btn-sm btn-outline" data-detail-action="refreshOverage" data-id="' + idAttr + '" type="button">' + escapeHtml(t('detail.overageRefresh')) + '</button>' +
-      '</h4>' +
-      '<p class="help-block">' + escapeHtml(t('detail.overageHint')) + '</p>' +
-      renderOverageBlock(a, idAttr) +
-      '</div>' +
-
-      '<div class="detail-section"><h4>' + escapeHtml(t('detail.proxyURL')) + '</h4><div class="machine-id-row">' +
-      '<input type="text" id="proxyURLInput" value="' + escapeAttr(a.proxyURL || '') + '" placeholder="socks5://host:port" />' +
-      '<button class="btn btn-sm btn-primary" data-detail-action="saveProxyURL" data-id="' + idAttr + '" type="button">' + escapeHtml(t('detail.save')) + '</button>' +
-      '</div><p class="help-block">' + escapeHtml(t('detail.proxyHint')) + '</p></div>' +
-
-      '<div class="detail-section"><h4>' + escapeHtml(t('detail.subscription')) + '</h4><div class="detail-grid">' +
+    const mainUsage = getMainUsageInfo(a);
+    const subscriptionHtml =
+      '<div class="detail-grid detail-grid-compact">' +
       detailItem(t('detail.subscriptionType'), a.subscriptionTitle || (a.subscriptionType ? formatSubscriptionLabel(a.subscriptionType) : '-')) +
-      detailItem(t('detail.tokenExpiry'), a.expiresAt ? new Date(a.expiresAt * 1000).toLocaleString() : '-') +
-      detailItem(t('detail.mainQuota'), (a.usageCurrent != null ? a.usageCurrent.toFixed(1) : 0) + ' / ' + (a.usageLimit != null ? a.usageLimit.toFixed(0) : 0)) +
+      detailItem(t('detail.mainQuota'), mainUsage.visible ? mainUsage.text : '-') +
       detailItem(t('detail.resetDate'), a.nextResetDate || '-') +
+      detailItem(t('detail.tokenExpiry'), a.expiresAt ? new Date(a.expiresAt * 1000).toLocaleString() : '-') +
       (a.trialUsageLimit > 0 ?
         detailItem(t('detail.trialQuota'), (a.trialUsageCurrent != null ? a.trialUsageCurrent.toFixed(1) : 0) + ' / ' + a.trialUsageLimit.toFixed(0)) +
         detailItem(t('detail.trialStatus'), a.trialStatus || '-') +
         detailItem(t('detail.trialExpiry'), a.trialExpiresAt ? new Date(a.trialExpiresAt * 1000).toLocaleString() : '-')
         : '') +
-      '</div></div>' +
-
-      '<div class="detail-section"><h4>' + escapeHtml(t('detail.statistics')) + '</h4><div class="detail-grid">' +
+      '</div>';
+    const settingsHtml =
+      '<div class="detail-edit-list">' +
+      detailEditRow(t('detail.machineId'),
+        '<div class="detail-control-row"><input type="text" id="machineIdInput" value="' + escapeAttr(a.machineId || '') + '" placeholder="UUID" />' +
+        '<button class="btn btn-xs btn-outline" id="generateMachineIdBtn" type="button">' + escapeHtml(t('detail.generate')) + '</button>' +
+        '<button class="btn btn-xs btn-primary" data-detail-action="saveMachineId" data-id="' + idAttr + '" type="button">' + escapeHtml(t('detail.save')) + '</button></div>', '') +
+      detailEditRow(t('detail.weight'),
+        '<div class="detail-control-row detail-control-short"><input type="number" id="weightInput" value="' + (a.weight || 0) + '" min="0" max="10" />' +
+        '<button class="btn btn-xs btn-primary" data-detail-action="saveWeight" data-id="' + idAttr + '" type="button">' + escapeHtml(t('detail.save')) + '</button></div>', t('detail.weightHint')) +
+      detailEditRow(t('detail.proxyURL'),
+        '<div class="detail-control-row"><input type="text" id="proxyURLInput" value="' + escapeAttr(a.proxyURL || '') + '" placeholder="socks5://host:port" />' +
+        '<button class="btn btn-xs btn-primary" data-detail-action="saveProxyURL" data-id="' + idAttr + '" type="button">' + escapeHtml(t('detail.save')) + '</button></div>', t('detail.proxyHint')) +
+      '</div>';
+    const overageHtml =
+      '<div class="detail-accordion-actions"><button class="btn btn-xs btn-outline" data-detail-action="refreshOverage" data-id="' + idAttr + '" type="button">' + escapeHtml(t('detail.overageRefresh')) + '</button></div>' +
+      '<p class="help-block detail-help-compact">' + escapeHtml(t('detail.overageHint')) + '</p>' +
+      renderOverageBlock(a, idAttr);
+    const statsHtml =
+      '<div class="detail-grid detail-grid-compact">' +
       detailItem(t('detail.requestCount'), a.requestCount || 0) +
       detailItem(t('detail.errorCount'), a.errorCount || 0) +
       detailItem(t('detail.totalTokens'), formatNum(a.totalTokens || 0)) +
       detailItem(t('detail.totalCredits'), (a.totalCredits || 0).toFixed(2)) +
-      '</div></div>' +
+      detailItem(t('detail.healthScore'), a.healthScore != null ? a.healthScore : '-') +
+      detailItem(t('detail.recent429Rate'), a.recent429Rate != null ? (Number(a.recent429Rate) * 100).toFixed(1) + '%' : '-') +
+      detailItem(t('detail.modeBucket'), a.modeBucket || '-') +
+      detailItem(t('detail.canRoute'), a.canRoute === false ? t('common.no') : t('common.yes')) +
+      '</div>';
+    const modelsHtml =
+      '<div class="detail-accordion-actions">' +
+      '<button class="btn btn-xs btn-outline" data-detail-action="loadModels" data-id="' + idAttr + '" type="button">' + escapeHtml(t('detail.loadModels')) + '</button>' +
+      '<button class="btn btn-xs btn-outline" data-detail-action="refreshModels" data-id="' + idAttr + '" type="button">' + escapeHtml(t('detail.refreshModelCache')) + '</button>' +
+      '</div><div id="modelsList" class="model-list"></div>';
 
-      '<div class="detail-section">' +
-      '<h4>' + escapeHtml(t('detail.models')) +
-      ' <button class="btn btn-sm btn-outline" data-detail-action="loadModels" data-id="' + idAttr + '" type="button">' + escapeHtml(t('detail.loadModels')) + '</button>' +
-      ' <button class="btn btn-sm btn-outline" data-detail-action="refreshModels" data-id="' + idAttr + '" type="button">' + escapeHtml(t('detail.refreshModelCache')) + '</button>' +
-      '</h4>' +
-      '<div id="modelsList" class="model-list"></div>' +
+    $('detailBody').innerHTML =
+      '<div class="detail-compact">' +
+      detailSection(t('detail.basicInfo'),
+        '<div class="detail-identity"><div class="detail-identity-main">' + escapeHtml(getDisplayEmail(a.email, null)) + '</div>' +
+        '<div class="detail-identity-sub">' + escapeHtml(a.userId || '-') + '</div></div>' +
+        '<div class="detail-grid detail-grid-compact">' +
+        detailItem(t('detail.authMethod'), formatAuthMethod(a.provider || a.authMethod)) +
+        detailItem(t('detail.region'), a.region || 'us-east-1') +
+        '</div>') +
+      detailSection(t('detail.subscription'), subscriptionHtml) +
+      detailAccordion(t('detail.accountSettings'), settingsHtml) +
+      detailAccordion(t('detail.overage'), overageHtml) +
+      detailAccordion(t('detail.statistics'), statsHtml) +
+      detailAccordion(t('detail.models'), modelsHtml) +
       '</div>';
 
     openDialog('detailModal');
@@ -1184,6 +1807,9 @@
     if (status === 'ENABLED') {
       return '<span class="badge badge-warning">' + escapeHtml(t('accounts.overageOn')) + '</span>';
     }
+    if (isOverMainQuota(a)) {
+      return '<span class="badge badge-warning">' + escapeHtml(t('accounts.overageDetected')) + '</span>';
+    }
     if (status === 'DISABLED') {
       return '<span class="badge badge-muted">' + escapeHtml(t('accounts.overageOff')) + '</span>';
     }
@@ -1197,6 +1823,8 @@
     const statusText = status === 'ENABLED' ? t('detail.overageEnabled')
       : status === 'DISABLED' ? t('detail.overageDisabled')
       : t('detail.overageUnknown');
+    const overageUsed = getOverageUsedPoints(a);
+    const overageCap = getOverageCapPoints(a);
     const disabledAttr = capable ? '' : ' disabled';
     return '<div class="form-group flex items-center gap-2">' +
       '<label class="switch"><input type="checkbox" id="overageSwitchInput-' + idAttr + '" data-detail-action="toggleOverage" data-id="' + idAttr + '" ' + (checked ? 'checked' : '') + disabledAttr + ' /><span class="slider"></span></label>' +
@@ -1205,9 +1833,9 @@
       (capable ? '' : '<p class="help-block" style="color:#ef4444">' + escapeHtml(t('detail.overageNotCapable')) + '</p>') +
       '<div class="detail-grid">' +
       detailItem(t('detail.overageStatus'), status || '-') +
-      detailItem(t('detail.overageCap'), a.overageCap ? '$' + Number(a.overageCap).toFixed(2) : '-') +
-      detailItem(t('detail.overageRate'), a.overageRate ? '$' + Number(a.overageRate).toFixed(4) : '-') +
-      detailItem(t('detail.overageCurrent'), a.currentOverages ? '$' + Number(a.currentOverages).toFixed(4) : '$0') +
+      detailItem(t('detail.overageCurrent'), formatUsageQuota(overageUsed, overageCap) + ' ' + t('accounts.pointsUnit')) +
+      detailItem(t('detail.overageCap'), formatPoints(overageCap)) +
+      detailItem(t('detail.overageRate'), a.overageRate ? formatPoints(a.overageRate) : '-') +
       detailItem(t('detail.overageCheckedAt'), checkedAt) +
       '</div>';
   }
@@ -1269,7 +1897,23 @@
   }
   function getTestModelValue() {
     const choice = $('testModelChoice');
-    return (choice && choice.value.trim()) || 'claude-sonnet-4';
+    return (choice && choice.value.trim()) || 'auto';
+  }
+  function isAutoModelOption(value) {
+    const normalized = String(value || '').trim().toLowerCase();
+    return normalized === 'auto' || normalized === String(t('accounts.modelAuto')).trim().toLowerCase();
+  }
+  function normalizeTestModelOptions(models) {
+    const result = [];
+    const seen = new Set();
+    (Array.isArray(models) ? models : []).forEach(model => {
+      const value = String(model || '').trim();
+      const key = value.toLowerCase();
+      if (!value || isAutoModelOption(value) || seen.has(key)) return;
+      seen.add(key);
+      result.push(value);
+    });
+    return result.sort((a, b) => a.localeCompare(b));
   }
   function renderTestLog() {
     const c = $('testModalLog');
@@ -1279,18 +1923,28 @@
       return;
     }
     c.innerHTML = testLogs.map(log =>
-      '<div class="test-log-line ' + escapeAttr(log.type || 'info') + '">' +
+      '<div class="test-log-line ' + escapeAttr(log.type || 'info') + '"' + (log.detail ? ' title="' + escapeAttr(log.detail) + '"' : '') + '>' +
       '<span class="test-log-time">' + escapeHtml(log.time) + '</span>' +
       '<span class="test-log-message">' + escapeHtml(log.msg) + '</span>' +
       '</div>'
     ).join('');
     c.scrollTop = c.scrollHeight;
   }
-  function addTestLog(msg, type) {
+  function addTestLog(msg, type, detail) {
     const time = new Date().toLocaleTimeString();
-    testLogs.push({ time, msg, type });
+    testLogs.push({ time, msg, type, detail });
     if (testLogs.length > 100) testLogs.shift();
     renderTestLog();
+  }
+  function summarizeTestError(message) {
+    const msg = String(message || '');
+    const lower = msg.toLowerCase();
+    if (lower.includes('429') || lower.includes('suspicious activity') || lower.includes('temporary limits')) {
+      return t('accounts.testLog.quotaSummary');
+    }
+    if (lower.includes('401') || lower.includes('403') || lower.includes('token')) return t('accounts.testLog.authSummary');
+    if (lower.includes('timeout')) return t('accounts.testLog.timeoutSummary');
+    return msg.length > 120 ? msg.slice(0, 120) + '…' : msg;
   }
   function clearTestLog() {
     testLogs = [];
@@ -1303,18 +1957,20 @@
     const idAttr = escapeAttr(testModalAccountId);
     const email = acc ? getDisplayEmail(acc.email, acc.id) : testModalAccountId;
     const proxy = acc ? (acc.proxyURL || t('accounts.testLog.globalProxy')) : '?';
+    const normalizedTestModels = normalizeTestModelOptions(testModalModels);
     const statusText = testModalLoadingModels
-      ? t('accounts.testModelsLoading')
+      ? t('accounts.testModelsLoadingShort')
       : testModalModelError
         ? t('accounts.testModelsFallback')
-        : t('accounts.testModelsReady', testModalModels.length);
+        : t('accounts.testModelsReadyShort', normalizedTestModels.length);
+    const modelOptions = ['auto'].concat(normalizedTestModels);
     const modelField = testModalLoadingModels
       ? '<div class="test-model-loading">' + escapeHtml(t('accounts.testModelsLoading')) + '</div>'
-      : testModalModels.length
+      : modelOptions.length
         ? '<select id="testModelChoice">' +
-        testModalModels.map(m => '<option value="' + escapeAttr(m) + '">' + escapeHtml(m) + '</option>').join('') +
+        modelOptions.map(m => '<option value="' + escapeAttr(m) + '">' + escapeHtml(m === 'auto' ? t('accounts.modelAuto') : m) + '</option>').join('') +
         '</select>'
-        : '<input type="text" id="testModelChoice" placeholder="claude-sonnet-4" value="claude-sonnet-4" />';
+        : '<input type="text" id="testModelChoice" placeholder="auto" value="auto" />';
 
     body.innerHTML =
       '<div class="test-modal-account">' +
@@ -1329,7 +1985,7 @@
       '</div>' +
       '<div class="test-modal-grid">' +
       '<div class="form-group test-model-field">' +
-      '<label for="testModelChoice">' + escapeHtml(t('accounts.selectModel')) + '</label>' +
+      '<label for="testModelChoice">' + escapeHtml(t('accounts.modelShort')) + '</label>' +
       modelField +
       '</div>' +
       '<div class="test-log-card">' +
@@ -1358,9 +2014,9 @@
     renderTestModal();
     openDialog('testModal');
     try {
-      const res = await api('/accounts/' + id + '/models/cached');
+      const res = await api('/accounts/' + encodeURIComponent(id) + '/models/cached');
       const d = await res.json();
-      testModalModels = Array.isArray(d.models) ? d.models.slice().sort() : [];
+      testModalModels = normalizeTestModelOptions(d.models);
     } catch (e) {
       testModalModelError = true;
     } finally {
@@ -1380,19 +2036,24 @@
     const acc = accountsData.find(a => a.id === id);
     const email = acc ? getDisplayEmail(acc.email, acc.id) : id;
     const proxy = acc ? (acc.proxyURL || t('accounts.testLog.globalProxy')) : '?';
-    addTestLog(t('accounts.testLog.start', email, model, proxy), 'info');
+    addTestLog(t('accounts.testLog.startShort', model, proxy), 'info');
     try {
       const startTime = Date.now();
-      const res = await api('/accounts/' + id + '/test', { method: 'POST', body: JSON.stringify({ model }) });
+      const body = model === 'auto' ? {} : { model };
+      const res = await api('/accounts/' + encodeURIComponent(id) + '/test', { method: 'POST', body: JSON.stringify(body) });
       const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
       const d = await res.json();
       if (d.success) {
-        addTestLog(t('accounts.testLog.success', email, elapsed, d.reply), 'ok');
+        addTestLog(t('accounts.testLog.successShort', elapsed, d.reply || 'ok'), 'ok');
+        loadAccounts(); loadStats();
       } else {
-        addTestLog(t('accounts.testLog.failed', email, elapsed, d.error || t('common.unknownError')), 'err');
+        const err = d.error || t('common.unknownError');
+        addTestLog(t('accounts.testLog.failedShort', elapsed, summarizeTestError(err)), 'err', err);
+        loadAccounts(); loadStats();
       }
     } catch (e) {
-      addTestLog(t('accounts.testLog.error', email, e.message), 'err');
+      addTestLog(t('accounts.testLog.errorShort', summarizeTestError(e.message)), 'err', e.message);
+      loadAccounts(); loadStats();
     }
     testModalRunning = false;
     if (modalBtn) modalBtn.removeAttribute('aria-busy');
@@ -1404,6 +2065,9 @@
     const d = await res.json();
     $('requireApiKey').checked = d.requireApiKey;
     $('allowOverUsage').checked = d.allowOverUsage || false;
+    selectedBalanceMode = d.balanceMode || 'health';
+    if ($('balanceMode')) $('balanceMode').value = selectedBalanceMode;
+    applyRoutingConcurrencySettings(d.routingConcurrency || {});
     await Promise.all([loadThinkingConfig(), loadEndpointConfig(), loadProxyConfig(), loadPromptFilter(), loadApiKeys()]);
     refreshCustomSelects();
   }
@@ -1511,6 +2175,52 @@
     const allowOverUsage = $('allowOverUsage').checked;
     await api('/settings', { method: 'POST', body: JSON.stringify({ allowOverUsage }) });
     toast(t('settings.overUsageSaved'), 'success');
+  }
+  function applyRoutingConcurrencySettings(rc) {
+    const defaults = {
+      enabled: false,
+      globalMaxConcurrent: 0,
+      globalQueueSize: 100,
+      globalQueueTimeoutMs: 30000,
+      perAccountMaxConcurrent: 1,
+      perAccountMinIntervalMs: 0,
+      stickyAccount: true,
+      overflowToOtherAccounts: true
+    };
+    const d = Object.assign({}, defaults, rc || {});
+    if ($('routingConcurrencyEnabled')) $('routingConcurrencyEnabled').checked = !!d.enabled;
+    if ($('globalMaxConcurrent')) $('globalMaxConcurrent').value = Number(d.globalMaxConcurrent || 0);
+    if ($('globalQueueSize')) $('globalQueueSize').value = Number(d.globalQueueSize ?? 100);
+    if ($('globalQueueTimeoutMs')) $('globalQueueTimeoutMs').value = Number(d.globalQueueTimeoutMs || 30000);
+    if ($('perAccountMaxConcurrent')) $('perAccountMaxConcurrent').value = Number(d.perAccountMaxConcurrent || 1);
+    if ($('perAccountMinIntervalMs')) $('perAccountMinIntervalMs').value = Number(d.perAccountMinIntervalMs || 0);
+    if ($('stickyAccount')) $('stickyAccount').checked = d.stickyAccount !== false;
+    if ($('overflowToOtherAccounts')) $('overflowToOtherAccounts').checked = d.overflowToOtherAccounts !== false;
+  }
+  function readNumberInput(id, fallback) {
+    const el = $(id);
+    if (!el) return fallback;
+    const n = Number(el.value);
+    return Number.isFinite(n) ? n : fallback;
+  }
+  async function saveRoutingConcurrencyConfig() {
+    const routingConcurrency = {
+      enabled: !!($('routingConcurrencyEnabled') && $('routingConcurrencyEnabled').checked),
+      globalMaxConcurrent: Math.max(0, Math.floor(readNumberInput('globalMaxConcurrent', 0))),
+      globalQueueSize: Math.max(0, Math.floor(readNumberInput('globalQueueSize', 100))),
+      globalQueueTimeoutMs: Math.max(1, Math.floor(readNumberInput('globalQueueTimeoutMs', 30000))),
+      perAccountMaxConcurrent: Math.max(1, Math.floor(readNumberInput('perAccountMaxConcurrent', 1))),
+      perAccountMinIntervalMs: Math.max(0, Math.floor(readNumberInput('perAccountMinIntervalMs', 0))),
+      stickyAccount: !!($('stickyAccount') && $('stickyAccount').checked),
+      overflowToOtherAccounts: !!($('overflowToOtherAccounts') && $('overflowToOtherAccounts').checked)
+    };
+    await api('/settings', { method: 'POST', body: JSON.stringify({ routingConcurrency }) });
+    toast(t('settings.routingConcurrencySaved'), 'success');
+  }
+  async function saveBalanceModeConfig() {
+    selectedBalanceMode = ($('balanceMode') && $('balanceMode').value) || 'health';
+    await api('/settings', { method: 'POST', body: JSON.stringify({ balanceMode: selectedBalanceMode }) });
+    toast(t('settings.balanceModeSaved'), 'success');
   }
   async function changePassword() {
     const np = $('newPassword').value;
@@ -2543,11 +3253,30 @@
   }
   function closeUpdateModal() { closeDialog('updateModal'); }
 
+  function switchSettingsTab(tab) {
+    const validTabs = ['access', 'routing', 'model', 'system', 'advanced'];
+    if (!validTabs.includes(tab)) tab = 'access';
+    currentSettingsTab = tab;
+    localStorage.setItem('settingsSubtab', tab);
+    qsa('[data-settings-tab]').forEach(btn => {
+      const active = btn.dataset.settingsTab === tab;
+      btn.classList.toggle('active', active);
+      btn.setAttribute('aria-selected', String(active));
+      btn.tabIndex = active ? 0 : -1;
+    });
+    qsa('[data-settings-panel]').forEach(panel => {
+      const active = panel.dataset.settingsPanel === tab;
+      panel.classList.toggle('active', active);
+      panel.hidden = !active;
+    });
+  }
+
   // Tabs
   function switchTab(tab) {
     qsa('.tab').forEach(el => el.classList.toggle('active', el.dataset.tab === tab));
     qsa('.tab-content').forEach(c => c.classList.add('hidden'));
     $('tab' + tab.charAt(0).toUpperCase() + tab.slice(1)).classList.remove('hidden');
+    if (tab === 'metrics') loadMetrics().catch(() => toast(t('metrics.loadFailed'), 'error'));
   }
 
   // Event wiring
@@ -2589,6 +3318,15 @@
     $('logoutBtn').addEventListener('click', logout);
 
     qsa('#tabBar .tab').forEach(tab => tab.addEventListener('click', () => switchTab(tab.dataset.tab)));
+    qsa('[data-settings-tab]').forEach(tab => tab.addEventListener('click', () => switchSettingsTab(tab.dataset.settingsTab)));
+    switchSettingsTab(currentSettingsTab);
+    const metricsSelect = $('metricsRangeSelect');
+    if (metricsSelect) {
+      metricsSelect.value = metricsRange;
+      metricsSelect.addEventListener('change', () => loadMetrics().catch(() => toast(t('metrics.loadFailed'), 'error')));
+    }
+    const metricsRefresh = $('metricsRefreshBtn');
+    if (metricsRefresh) metricsRefresh.addEventListener('click', () => loadMetrics().catch(() => toast(t('metrics.loadFailed'), 'error')));
 
     qsa('[data-copy]').forEach(btn => btn.addEventListener('click', async () => {
       const id = btn.dataset.copy;
@@ -2618,26 +3356,40 @@
     qsa('[data-batch]').forEach(b => b.addEventListener('click', () => {
       const a = b.dataset.batch;
       if (a === 'refreshModels') batchRefreshModels();
+      else if (a === 'testAuto') batchTestAuto();
       else if (a === 'delete') batchDelete();
       else batchAction(a);
     }));
 
+    qsa('[data-view-mode]').forEach(btn => btn.addEventListener('click', () => setAccountsViewMode(btn.dataset.viewMode)));
+    renderAccountsViewToggle();
+
     $('filterSearch').addEventListener('input', onFilterChange);
-    $('filterStatusSelect').addEventListener('change', onFilterChange);
+    ['filterStatusSelect', 'filterTierSelect', 'filterProxySelect', 'filterSortSelect'].forEach(id => {
+      const el = $(id);
+      if (el) el.addEventListener('change', onFilterChange);
+    });
+    const summary = $('accountsSummary');
+    if (summary) summary.addEventListener('click', e => {
+      const btn = e.target.closest('[data-summary-filter]');
+      if (!btn) return;
+      const key = btn.dataset.summaryFilter;
+      setStatusFilter(key === 'total' ? 'all' : key === 'ready' ? 'ready' : key === 'quota' ? 'quota' : key === 'recent429' ? 'recent429' : key === 'auth' ? 'auth' : key === 'blocked' ? 'blocked' : key === 'disabled' ? 'disabled' : 'cooling');
+    });
 
     $('accountsList').addEventListener('click', e => {
       const cb = e.target.closest('.account-checkbox');
       if (cb) {
         toggleSelectAccount(cb.dataset.id);
-        const card = cb.closest('.account-card');
-        if (card) card.classList.toggle('selected', cb.checked);
+        const item = cb.closest('.account-card, .account-list-row');
+        if (item) item.classList.toggle('selected', cb.checked);
         return;
       }
       const btn = e.target.closest('button[data-action]');
       if (!btn) return;
       const id = btn.dataset.id;
       const action = btn.dataset.action;
-      if (action === 'refresh') refreshAccount(id, btn.closest('.account-card'));
+      if (action === 'refresh') refreshAccount(id, btn.closest('.account-card, .account-list-row'));
       else if (action === 'detail') showDetail(id);
       else if (action === 'copyJSON') copyAccountJSON(id, btn);
       else if (action === 'toggle') toggleAccount(id, btn.dataset.enabled === 'true');
@@ -2649,7 +3401,10 @@
   function bindSettingsEvents() {
     $('saveRequireApiKeyBtn').addEventListener('click', saveRequireApiKey);
     $('saveOverUsageBtn').addEventListener('click', saveOverUsageConfig);
+    if ($('saveBalanceModeBtn'))     $('saveBalanceModeBtn').addEventListener('click', saveBalanceModeConfig);
+    $('saveRoutingConcurrencyBtn').addEventListener('click', saveRoutingConcurrencyConfig);
     $('saveThinkingBtn').addEventListener('click', saveThinkingConfig);
+
     $('saveEndpointBtn').addEventListener('click', saveEndpointConfig);
     $('changePasswordBtn').addEventListener('click', changePassword);
     $('proxyType').addEventListener('change', onProxyTypeChange);

@@ -22,9 +22,9 @@ type OverageSnapshot struct {
 	Status            string  `json:"status"`            // "ENABLED" | "DISABLED" | "UNKNOWN"
 	Capability        string  `json:"capability"`        // "OVERAGE_CAPABLE" | ...
 	SubscriptionTitle string  `json:"subscriptionTitle"` // e.g. "KIRO PRO+"
-	OverageCap        float64 `json:"overageCap"`        // USD upper bound
-	OverageRate       float64 `json:"overageRate"`       // per-invocation USD
-	CurrentOverages   float64 `json:"currentOverages"`   // accumulated overage USD
+	OverageCap        float64 `json:"overageCap"`        // overage point upper bound
+	OverageRate       float64 `json:"overageRate"`       // per-invocation points
+	CurrentOverages   float64 `json:"currentOverages"`   // accumulated overage points
 	CheckedAt         int64   `json:"checkedAt"`         // Unix seconds
 }
 

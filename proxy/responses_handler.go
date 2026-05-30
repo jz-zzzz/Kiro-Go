@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -114,30 +115,42 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 	respID := generateResponseID()
 
 	if req.Stream {
-		h.handleResponsesStream(w, kiroPayload, actualModel, thinking, estimatedInputTokens,
+		h.handleResponsesStream(r.Context(), w, kiroPayload, actualModel, thinking, estimatedInputTokens,
 			apiKeyID, respID, &req, storedInputCopy, storeResponse)
 		return
 	}
 
-	h.handleResponsesNonStream(w, kiroPayload, actualModel, thinking, estimatedInputTokens,
+	h.handleResponsesNonStream(r.Context(), w, kiroPayload, actualModel, thinking, estimatedInputTokens,
 		apiKeyID, respID, &req, storedInputCopy, storeResponse)
 }
 
 func (h *Handler) handleResponsesNonStream(
+	ctx context.Context,
 	w http.ResponseWriter, payload *KiroPayload, model string, thinking bool,
 	estimatedInputTokens int, apiKeyID, respID string,
 	req *ResponsesRequest, storedInput json.RawMessage, storeResponse bool,
 ) {
+	requestStartedAt := time.Now()
 	excluded := make(map[string]bool)
 	var lastErr error
+	var lastAccount *config.Account
 
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account := h.pool.GetNextForModelExcluding(model, excluded)
-		if account == nil {
+		account, release, acquireErr := h.acquireRouteAccount(ctx, model, excluded, apiKeyID)
+		if acquireErr != nil {
+			if isRoutingLimitError(acquireErr) {
+				h.recordFailure()
+				statusCode, errType := metricsErrorDetails(acquireErr, http.StatusTooManyRequests, "rate_limit_error")
+				recordRequestMetrics("responses", model, false, nil, apiKeyID, false, statusCode, errType, estimatedInputTokens, 0, 0, requestStartedAt)
+				h.sendOpenAIError(w, 429, "rate_limit_error", routingErrorMessage(acquireErr))
+				return
+			}
 			break
 		}
 		if err := h.ensureValidToken(account); err != nil {
+			release()
 			lastErr = err
+			lastAccount = account
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
 			continue
@@ -166,8 +179,10 @@ func (h *Handler) handleResponsesNonStream(
 		}
 
 		err := CallKiroAPI(account, payload, callback)
+		release()
 		if err != nil {
 			lastErr = err
+			lastAccount = account
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
 			continue
@@ -186,6 +201,7 @@ func (h *Handler) handleResponsesNonStream(
 		outputTokens = estimateOpenAIOutputTokens(finalContent, reasoningContent, toolUses)
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
+		recordRequestMetrics("responses", model, false, account, apiKeyID, true, http.StatusOK, "", inputTokens, outputTokens, credits, requestStartedAt)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 
@@ -205,10 +221,13 @@ func (h *Handler) handleResponsesNonStream(
 	}
 
 	if lastErr == nil {
+		recordRequestMetrics("responses", model, false, nil, apiKeyID, false, http.StatusServiceUnavailable, "no_available_accounts", estimatedInputTokens, 0, 0, requestStartedAt)
 		h.sendOpenAIError(w, 503, "server_error", "No available accounts")
 		return
 	}
 	h.recordFailure()
+	statusCode, errType := metricsErrorDetails(lastErr, http.StatusInternalServerError, "server_error")
+	recordRequestMetrics("responses", model, false, lastAccount, apiKeyID, false, statusCode, errType, estimatedInputTokens, 0, 0, requestStartedAt)
 	h.sendOpenAIError(w, 500, "server_error", lastErr.Error())
 }
 
@@ -270,10 +289,12 @@ func buildResponsesObject(
 }
 
 func (h *Handler) handleResponsesStream(
+	ctx context.Context,
 	w http.ResponseWriter, payload *KiroPayload, model string, thinking bool,
 	estimatedInputTokens int, apiKeyID, respID string,
 	req *ResponsesRequest, storedInput json.RawMessage, storeResponse bool,
 ) {
+	requestStartedAt := time.Now()
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -312,15 +333,32 @@ func (h *Handler) handleResponsesStream(
 
 	excluded := make(map[string]bool)
 	var lastErr error
+	var lastAccount *config.Account
 	responseStarted := false
 
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account := h.pool.GetNextForModelExcluding(model, excluded)
-		if account == nil {
+		account, release, acquireErr := h.acquireRouteAccount(ctx, model, excluded, apiKeyID)
+		if acquireErr != nil {
+			if isRoutingLimitError(acquireErr) {
+				h.recordFailure()
+				statusCode, errType := metricsErrorDetails(acquireErr, http.StatusTooManyRequests, "rate_limit_error")
+				recordRequestMetrics("responses", model, true, nil, apiKeyID, false, statusCode, errType, estimatedInputTokens, 0, 0, requestStartedAt)
+				send("response.failed", map[string]interface{}{
+					"type": "response.failed",
+					"response": map[string]interface{}{
+						"id":     respID,
+						"status": "failed",
+						"error":  map[string]string{"type": "rate_limit_error", "message": routingErrorMessage(acquireErr)},
+					},
+				})
+				return
+			}
 			break
 		}
 		if err := h.ensureValidToken(account); err != nil {
+			release()
 			lastErr = err
+			lastAccount = account
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
 			continue
@@ -468,6 +506,7 @@ func (h *Handler) handleResponsesStream(
 		}
 
 		err := CallKiroAPI(account, payload, callback)
+		release()
 		if err != nil {
 			if !responseStarted {
 				lastErr = err
@@ -475,6 +514,8 @@ func (h *Handler) handleResponsesStream(
 				h.handleAccountFailure(account, err)
 				continue
 			}
+			statusCode, errType := metricsErrorDetails(err, http.StatusInternalServerError, "server_error")
+			recordRequestMetrics("responses", model, true, account, apiKeyID, false, statusCode, errType, estimatedInputTokens, outputTokens, credits, requestStartedAt)
 			send("response.failed", map[string]interface{}{
 				"type": "response.failed",
 				"response": map[string]interface{}{
@@ -531,6 +572,7 @@ func (h *Handler) handleResponsesStream(
 		outputTokens = estimateOpenAIOutputTokens(finalContent, reasoning, toolUses)
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
+		recordRequestMetrics("responses", model, true, account, apiKeyID, true, http.StatusOK, "", inputTokens, outputTokens, credits, requestStartedAt)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 
@@ -555,6 +597,7 @@ func (h *Handler) handleResponsesStream(
 	}
 
 	if lastErr == nil {
+		recordRequestMetrics("responses", model, true, nil, apiKeyID, false, http.StatusServiceUnavailable, "no_available_accounts", estimatedInputTokens, 0, 0, requestStartedAt)
 		send("response.failed", map[string]interface{}{
 			"type": "response.failed",
 			"response": map[string]interface{}{
@@ -569,6 +612,8 @@ func (h *Handler) handleResponsesStream(
 		return
 	}
 	h.recordFailure()
+	statusCode, errType := metricsErrorDetails(lastErr, http.StatusInternalServerError, "server_error")
+	recordRequestMetrics("responses", model, true, lastAccount, apiKeyID, false, statusCode, errType, estimatedInputTokens, 0, 0, requestStartedAt)
 	send("response.failed", map[string]interface{}{
 		"type": "response.failed",
 		"response": map[string]interface{}{

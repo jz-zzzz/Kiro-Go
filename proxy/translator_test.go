@@ -366,6 +366,120 @@ func TestConvertOpenAIToolsSanitizesSchemaAndDescription(t *testing.T) {
 	}
 }
 
+func TestSanitizeToolInputCoercesSchemaTypes(t *testing.T) {
+	schema := map[string]interface{}{
+		"type": "object",
+		"properties": map[string]interface{}{
+			"-n":        map[string]interface{}{"type": "boolean"},
+			"recursive": map[string]interface{}{"type": "boolean"},
+			"limit":     map[string]interface{}{"type": "integer"},
+			"ratio":     map[string]interface{}{"type": "number"},
+			"todos":     map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "object"}},
+			"metadata":  map[string]interface{}{"type": "object"},
+			"nested": map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"enabled": map[string]interface{}{"type": "boolean"},
+				},
+			},
+		},
+	}
+	input := map[string]interface{}{
+		"-n":        "print line numbers",
+		"recursive": "false",
+		"limit":     "12",
+		"ratio":     "0.75",
+		"todos":     `[{"content":"fix proxy"}]`,
+		"metadata":  `{"source":"kiro"}`,
+		"nested": map[string]interface{}{
+			"enabled": "1",
+		},
+	}
+
+	got := sanitizeToolInput(input, schema)
+	if got["-n"] != true {
+		t.Fatalf("expected -n to be coerced to true, got %#v", got["-n"])
+	}
+	if got["recursive"] != false {
+		t.Fatalf("expected recursive to be coerced to false, got %#v", got["recursive"])
+	}
+	if got["limit"] != 12 {
+		t.Fatalf("expected limit to be coerced to integer, got %#v", got["limit"])
+	}
+	if got["ratio"] != 0.75 {
+		t.Fatalf("expected ratio to be coerced to number, got %#v", got["ratio"])
+	}
+	if todos, ok := got["todos"].([]interface{}); !ok || len(todos) != 1 {
+		t.Fatalf("expected todos to be coerced to array, got %#v", got["todos"])
+	}
+	if metadata, ok := got["metadata"].(map[string]interface{}); !ok || metadata["source"] != "kiro" {
+		t.Fatalf("expected metadata to be coerced to object, got %#v", got["metadata"])
+	}
+	nested := got["nested"].(map[string]interface{})
+	if nested["enabled"] != true {
+		t.Fatalf("expected nested enabled to be coerced to true, got %#v", nested["enabled"])
+	}
+}
+
+func TestNormalizeCommonToolInputScalarsWithoutSchema(t *testing.T) {
+	input := map[string]interface{}{
+		"context":     "3",
+		"offset":      "120",
+		"limit":       "40",
+		"-C":          "7",
+		"-A":          "2",
+		"-B":          "1",
+		"-i":          "case insensitive",
+		"-n":          "false",
+		"replace_all": "true",
+		"pattern":     "120",
+		"todos":       `[{"content":"fix proxy","id":"p1","status":"pending"}]`,
+		"nested": map[string]interface{}{
+			"head_limit": "5",
+		},
+	}
+
+	got := normalizeCommonToolInputScalars(input)
+	if got["context"] != 3 {
+		t.Fatalf("expected context to be number, got %#v", got["context"])
+	}
+	if got["offset"] != 120 {
+		t.Fatalf("expected offset to be number, got %#v", got["offset"])
+	}
+	if got["limit"] != 40 {
+		t.Fatalf("expected limit to be number, got %#v", got["limit"])
+	}
+	if got["-C"] != 7 {
+		t.Fatalf("expected -C to be number, got %#v", got["-C"])
+	}
+	if got["-A"] != 2 {
+		t.Fatalf("expected -A to be number, got %#v", got["-A"])
+	}
+	if got["-B"] != 1 {
+		t.Fatalf("expected -B to be number, got %#v", got["-B"])
+	}
+	if got["-i"] != true {
+		t.Fatalf("expected -i to be coerced to true, got %#v", got["-i"])
+	}
+	if got["-n"] != false {
+		t.Fatalf("expected -n to be coerced to false, got %#v", got["-n"])
+	}
+	if got["replace_all"] != true {
+		t.Fatalf("expected replace_all to be coerced to true, got %#v", got["replace_all"])
+	}
+	if got["pattern"] != "120" {
+		t.Fatalf("expected unrelated string field to remain unchanged, got %#v", got["pattern"])
+	}
+	todos, ok := got["todos"].([]interface{})
+	if !ok || len(todos) != 1 {
+		t.Fatalf("expected todos JSON string to be coerced to array, got %#v", got["todos"])
+	}
+	nested := got["nested"].(map[string]interface{})
+	if nested["head_limit"] != 5 {
+		t.Fatalf("expected nested head_limit to be number, got %#v", nested["head_limit"])
+	}
+}
+
 func schemaContainsKey(value interface{}, key string) bool {
 	switch v := value.(type) {
 	case map[string]interface{}:
@@ -407,6 +521,10 @@ func TestParseModelAndThinking(t *testing.T) {
 
 		// Bare family name passes through (no minor to normalize).
 		{"bare sonnet 4", "claude-sonnet-4", "claude-sonnet-4", false},
+
+		// Auto intentionally omits modelId so account/Kiro-side routing can choose.
+		{"auto model routing", "auto", "", false},
+		{"auto thinking routing", "auto-thinking", "", true},
 
 		// Dated snapshot must hit the alias before the regex rewrites it.
 		{"dated sonnet snapshot", "claude-sonnet-4-20250514", "claude-sonnet-4", false},

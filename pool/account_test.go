@@ -1,6 +1,7 @@
 package pool
 
 import (
+	"context"
 	"errors"
 	"kiro-go/config"
 	"path/filepath"
@@ -209,6 +210,67 @@ func TestGetNextForModelExcludingReturnsNilOnEmptyPool(t *testing.T) {
 	}
 }
 
+func TestAcquireForModelHonorsPerAccountConcurrencyAndOverflow(t *testing.T) {
+	cfgFile := filepath.Join(t.TempDir(), "config.json")
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	if err := config.UpdateRoutingConcurrencyConfig(config.RoutingConcurrencyConfig{
+		Enabled:                 true,
+		GlobalQueueSize:         0,
+		GlobalQueueTimeoutMs:    50,
+		PerAccountMaxConcurrent: 1,
+		StickyAccount:           true,
+		OverflowToOtherAccounts: true,
+	}); err != nil {
+		t.Fatalf("UpdateRoutingConcurrencyConfig: %v", err)
+	}
+	p := newTestPool(config.Account{ID: "a"}, config.Account{ID: "b"})
+
+	first, releaseFirst, err := p.AcquireForModel(context.Background(), "", nil, "key")
+	if err != nil {
+		t.Fatalf("first acquire: %v", err)
+	}
+	second, releaseSecond, err := p.AcquireForModel(context.Background(), "", nil, "key")
+	if err != nil {
+		releaseFirst()
+		t.Fatalf("second acquire: %v", err)
+	}
+	defer releaseFirst()
+	defer releaseSecond()
+	if first.ID == second.ID {
+		t.Fatalf("expected overflow to another account, got %q twice", first.ID)
+	}
+}
+
+func TestAcquireForModelQueueTimeout(t *testing.T) {
+	cfgFile := filepath.Join(t.TempDir(), "config.json")
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	if err := config.UpdateRoutingConcurrencyConfig(config.RoutingConcurrencyConfig{
+		Enabled:                 true,
+		GlobalMaxConcurrent:     1,
+		GlobalQueueSize:         1,
+		GlobalQueueTimeoutMs:    10,
+		PerAccountMaxConcurrent: 1,
+		StickyAccount:           true,
+		OverflowToOtherAccounts: true,
+	}); err != nil {
+		t.Fatalf("UpdateRoutingConcurrencyConfig: %v", err)
+	}
+	p := newTestPool(config.Account{ID: "a"})
+	_, release, err := p.AcquireForModel(context.Background(), "", nil, "key")
+	if err != nil {
+		t.Fatalf("first acquire: %v", err)
+	}
+	defer release()
+	_, _, err = p.AcquireForModel(context.Background(), "", nil, "other-key")
+	if !errors.Is(err, ErrRoutingQueueTimeout) {
+		t.Fatalf("expected queue timeout, got %v", err)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // DisableAccount
 // ---------------------------------------------------------------------------
@@ -323,5 +385,115 @@ func TestReloadDropsOverQuotaAccountWhenAllowOverUsageDisabled(t *testing.T) {
 
 	if got := p.GetNext(); got != nil {
 		t.Fatalf("expected over-quota account to be dropped, got %q", got.ID)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Local failover routing extensions
+// ---------------------------------------------------------------------------
+
+func initPoolTestConfig(t *testing.T) {
+	t.Helper()
+	cfgPath := filepath.Join(t.TempDir(), "config.json")
+	if err := config.Init(cfgPath); err != nil {
+		t.Fatalf("init config: %v", err)
+	}
+}
+
+func TestGetNextAllowsExpiredAccountWithRefreshToken(t *testing.T) {
+	p := &AccountPool{}
+	account := config.Account{
+		ID:           "refreshable",
+		AccessToken:  "expired-access-token",
+		RefreshToken: "refresh-token",
+		ExpiresAt:    time.Now().Add(-time.Minute).Unix(),
+	}
+
+	p.accounts = []config.Account{account}
+
+	got := p.GetNext()
+	if got == nil {
+		t.Fatalf("expected expired account with refresh token to be routable for refresh")
+	}
+	if got.ID != account.ID {
+		t.Fatalf("expected account %q, got %q", account.ID, got.ID)
+	}
+}
+
+func TestGetNextSkipsExpiredAccountWithoutRefreshToken(t *testing.T) {
+	p := &AccountPool{}
+	p.accounts = []config.Account{
+		{ID: "expired", AccessToken: "expired-access-token", ExpiresAt: time.Now().Add(-time.Minute).Unix()},
+	}
+
+	if got := p.GetNext(); got != nil {
+		t.Fatalf("expected expired account without refresh token to be skipped, got %#v", got)
+	}
+}
+
+func TestAvailableCountMatchesRealRoutingConstraints(t *testing.T) {
+	initPoolTestConfig(t)
+	if err := config.UpdateAllowOverUsage(false); err != nil {
+		t.Fatalf("disable global over-usage: %v", err)
+	}
+
+	now := time.Now()
+	p := &AccountPool{
+		accounts: []config.Account{
+			{ID: "ok", AccessToken: "token", ExpiresAt: now.Add(10 * time.Minute).Unix()},
+			{ID: "cooldown", AccessToken: "token", ExpiresAt: now.Add(10 * time.Minute).Unix()},
+			{ID: "expired", AccessToken: "token", ExpiresAt: now.Add(30 * time.Second).Unix()},
+			{ID: "refreshable", AccessToken: "token", RefreshToken: "refresh-token", ExpiresAt: now.Add(30 * time.Second).Unix()},
+			{ID: "over", AccessToken: "token", ExpiresAt: now.Add(10 * time.Minute).Unix(), UsageCurrent: 10, UsageLimit: 10},
+		},
+		cooldowns: map[string]time.Time{"cooldown": now.Add(time.Minute)},
+	}
+
+	if got := p.AvailableCount(); got != 2 {
+		t.Fatalf("expected 2 available or refreshable accounts, got %d", got)
+	}
+}
+
+func TestAvailableCountSkipsExpiredAccountWithoutRefreshToken(t *testing.T) {
+	initPoolTestConfig(t)
+	if err := config.UpdateAllowOverUsage(false); err != nil {
+		t.Fatalf("disable global over-usage: %v", err)
+	}
+
+	now := time.Now()
+	p := &AccountPool{
+		accounts: []config.Account{
+			{ID: "expired", AccessToken: "token", ExpiresAt: now.Add(-time.Minute).Unix()},
+		},
+	}
+
+	if got := p.AvailableCount(); got != 0 {
+		t.Fatalf("expected expired account without refresh token to be unavailable, got %d", got)
+	}
+}
+
+func TestHealthSnapshotsKeepRefreshableExpiredAccountsRoutable(t *testing.T) {
+	initPoolTestConfig(t)
+	if err := config.UpdateAllowOverUsage(false); err != nil {
+		t.Fatalf("disable global over-usage: %v", err)
+	}
+
+	now := time.Now()
+	p := &AccountPool{
+		accounts: []config.Account{
+			{ID: "refreshable", AccessToken: "token", RefreshToken: "refresh-token", ExpiresAt: now.Add(-time.Minute).Unix()},
+			{ID: "expired", AccessToken: "token", ExpiresAt: now.Add(-time.Minute).Unix()},
+		},
+		errorCounts: make(map[string]int),
+		requestLog:  make(map[string][]requestEvent),
+		lastErrorAt: make(map[string]time.Time),
+	}
+
+	snapshots := p.GetHealthSnapshots()
+	if !snapshots["refreshable"].CanRoute {
+		t.Fatalf("expected expired account with refresh token to remain routable for refresh")
+	}
+	if snapshots["expired"].CanRoute {
+		t.Fatalf("expected expired account without refresh token to be non-routable")
 	}
 }

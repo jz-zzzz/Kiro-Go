@@ -9,9 +9,21 @@ import (
 
 const maxAccountRetryAttempts = 3
 
+func isSuspicious429ErrorMessage(msg string) bool {
+	return strings.Contains(strings.ToLower(msg), "429") && classifyKiro429Body(msg) == "suspicious_temporary_limits"
+}
+
+func isTransient429ErrorMessage(msg string) bool {
+	lower := strings.ToLower(msg)
+	if !strings.Contains(lower, "429") && !strings.Contains(lower, "too many requests") {
+		return false
+	}
+	return classifyKiro429Body(msg) != "suspicious_temporary_limits"
+}
+
 func isQuotaErrorMessage(msg string) bool {
 	msg = strings.ToLower(msg)
-	return strings.Contains(msg, "429") || strings.Contains(msg, "quota")
+	return strings.Contains(msg, "quota")
 }
 
 func isOverageErrorMessage(msg string) bool {
@@ -35,6 +47,9 @@ func isAuthErrorMessage(msg string) bool {
 	msg = strings.ToLower(msg)
 	return strings.Contains(msg, "http 401") ||
 		strings.Contains(msg, "http 403") ||
+		strings.Contains(msg, "refresh failed: 401") ||
+		strings.Contains(msg, "refresh failed: 403") ||
+		strings.Contains(msg, "bad credentials") ||
 		strings.Contains(msg, "unauthorized") ||
 		strings.Contains(msg, "forbidden") ||
 		strings.Contains(msg, "authentication failed") ||
@@ -98,8 +113,13 @@ func (h *Handler) handleAccountFailure(account *config.Account, err error) {
 	case isOverageErrorMessage(errMsg):
 		h.disableAccountOverage(account)
 		h.pool.RecordError(account.ID, false)
+	case isSuspicious429ErrorMessage(errMsg):
+		h.pool.QuarantineAccount429(account.ID)
+	case isTransient429ErrorMessage(errMsg):
+		h.pool.RecordTransient429(account.ID)
+		logger.Warnf("[AccountFailover] Transient 429 for %s, keeping account enabled for retry", account.Email)
 	case isQuotaErrorMessage(errMsg):
-		h.pool.RecordError(account.ID, true)
+		h.pool.QuarantineAccount429(account.ID)
 	case isSuspensionErrorMessage(errMsg):
 		h.disableAccount(account, "BANNED", "AWS temporarily suspended - unusual user activity detected")
 	case isProfileUnavailableErrorMessage(errMsg):
@@ -108,8 +128,36 @@ func (h *Handler) handleAccountFailure(account *config.Account, err error) {
 		// but never auto-disable — operators can still investigate via warn logs.
 		h.pool.RecordError(account.ID, false)
 	case isAuthErrorMessage(errMsg):
-		h.disableAccount(account, "BANNED", "Authentication failed - token invalid or expired")
+		h.disableAccount(account, "DISABLED", "Authentication failed - token invalid or expired")
 	default:
 		h.pool.RecordError(account.ID, false)
+	}
+}
+
+func (h *Handler) handleAccountTestFailure(account *config.Account, err error) {
+	if account == nil || err == nil {
+		return
+	}
+
+	errMsg := err.Error()
+	switch {
+	case isSuspicious429ErrorMessage(errMsg):
+		h.pool.QuarantineAccount429(account.ID)
+	case isTransient429ErrorMessage(errMsg):
+		h.pool.RecordTransient429(account.ID)
+		logger.Warnf("[AccountFailover] Manual test hit transient 429 for %s, keeping account enabled", account.Email)
+	case isQuotaErrorMessage(errMsg):
+		h.pool.QuarantineAccount429(account.ID)
+	case isOverageErrorMessage(errMsg):
+		h.disableAccountOverage(account)
+		h.disableAccount(account, "DISABLED", "Manual test failed: "+errMsg)
+	case isSuspensionErrorMessage(errMsg):
+		h.disableAccount(account, "BANNED", "AWS temporarily suspended - unusual user activity detected")
+	case isProfileUnavailableErrorMessage(errMsg):
+		h.disableAccount(account, "SUSPENDED", "No available Kiro profile")
+	case isAuthErrorMessage(errMsg):
+		h.disableAccount(account, "DISABLED", "Authentication failed - token invalid or expired")
+	default:
+		h.disableAccount(account, "DISABLED", "Manual test failed: "+errMsg)
 	}
 }

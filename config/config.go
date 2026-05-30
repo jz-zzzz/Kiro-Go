@@ -60,13 +60,13 @@ type Account struct {
 	Weight int `json:"weight,omitempty"` // 0 or 1 = normal, 2+ = higher priority
 
 	// Upstream Overages state (mirrored from AWS Q `setUserPreference` / `getUsageLimits`).
-	// OverageStatus is the only switch that decides whether to keep dispatching once UsageLimit is reached.
+	// OverageStatus is the upstream switch state; usageCurrent > usageLimit is also treated as effective overage.
 	// Allowed values: "ENABLED", "DISABLED", "UNKNOWN" (or empty when not yet fetched).
 	OverageStatus     string  `json:"overageStatus,omitempty"`
 	OverageCapability string  `json:"overageCapability,omitempty"` // "OVERAGE_CAPABLE" / "NOT_OVERAGE_CAPABLE"
-	OverageCap        float64 `json:"overageCap,omitempty"`        // Hard upper bound (USD)
-	OverageRate       float64 `json:"overageRate,omitempty"`       // Per-invocation rate (USD)
-	CurrentOverages   float64 `json:"currentOverages,omitempty"`   // Cumulative overage charges (USD)
+	OverageCap        float64 `json:"overageCap,omitempty"`        // Hard upper bound (points)
+	OverageRate       float64 `json:"overageRate,omitempty"`       // Per-invocation points
+	CurrentOverages   float64 `json:"currentOverages,omitempty"`   // Cumulative overage points
 	OverageCheckedAt  int64   `json:"overageCheckedAt,omitempty"`  // Last successful upstream sync (Unix seconds)
 
 	// LegacyAllowOverage is kept for backward-compatible JSON loading only.
@@ -143,6 +143,19 @@ type ApiKeyEntry struct {
 	RequestsCount int64   `json:"requestsCount,omitempty"`
 }
 
+// RoutingConcurrencyConfig controls request routing concurrency, queueing,
+// per-account concurrency and sticky-account overflow behavior.
+type RoutingConcurrencyConfig struct {
+	Enabled                 bool `json:"enabled"`
+	GlobalMaxConcurrent     int  `json:"globalMaxConcurrent,omitempty"`
+	GlobalQueueSize         int  `json:"globalQueueSize,omitempty"`
+	GlobalQueueTimeoutMs    int  `json:"globalQueueTimeoutMs,omitempty"`
+	PerAccountMaxConcurrent int  `json:"perAccountMaxConcurrent,omitempty"`
+	PerAccountMinIntervalMs int  `json:"perAccountMinIntervalMs,omitempty"`
+	StickyAccount           bool `json:"stickyAccount"`
+	OverflowToOtherAccounts bool `json:"overflowToOtherAccounts"`
+}
+
 // Config represents the global application configuration.
 type Config struct {
 	// Server settings
@@ -173,6 +186,13 @@ type Config struct {
 	// usage quota has been exhausted. When enabled, the pool will not skip accounts
 	// solely because usageCurrent >= usageLimit.
 	AllowOverUsage bool `json:"allowOverUsage,omitempty"`
+
+	// BalanceMode controls how the account pool picks the next account.
+	// Supported values: "health", "managed", "aggressive".
+	BalanceMode string `json:"balanceMode,omitempty"`
+
+	// RoutingConcurrency controls sticky routing, per-account limits and global queueing.
+	RoutingConcurrency RoutingConcurrencyConfig `json:"routingConcurrency,omitempty"`
 
 	// Proxy configuration: optional outbound proxy for Kiro API requests
 	// Format: "socks5://host:port", "socks5://user:pass@host:port",
@@ -240,6 +260,87 @@ var (
 	cfgPath string
 )
 
+const (
+	autoQuarantineSuspicious429Reason = "AUTO_QUARANTINE_SUSPICIOUS_429"
+	autoQuarantineDuration            = time.Hour
+)
+
+func defaultRoutingConcurrencyConfig() RoutingConcurrencyConfig {
+	return RoutingConcurrencyConfig{
+		Enabled:                 false,
+		GlobalMaxConcurrent:     0,
+		GlobalQueueSize:         100,
+		GlobalQueueTimeoutMs:    30000,
+		PerAccountMaxConcurrent: 1,
+		PerAccountMinIntervalMs: 0,
+		StickyAccount:           true,
+		OverflowToOtherAccounts: true,
+	}
+}
+
+func normalizeRoutingConcurrencyConfig(in RoutingConcurrencyConfig) RoutingConcurrencyConfig {
+	def := defaultRoutingConcurrencyConfig()
+	isEmpty := in == (RoutingConcurrencyConfig{})
+	out := in
+	out.Enabled = in.Enabled
+	if out.GlobalMaxConcurrent < 0 {
+		out.GlobalMaxConcurrent = 0
+	}
+	if isEmpty || (!out.Enabled && out.GlobalQueueSize == 0) {
+		out.GlobalQueueSize = def.GlobalQueueSize
+	} else if out.GlobalQueueSize < 0 {
+		out.GlobalQueueSize = 0
+	}
+	if out.GlobalQueueTimeoutMs <= 0 {
+		out.GlobalQueueTimeoutMs = def.GlobalQueueTimeoutMs
+	}
+	if out.PerAccountMaxConcurrent <= 0 {
+		out.PerAccountMaxConcurrent = def.PerAccountMaxConcurrent
+	}
+	if out.PerAccountMinIntervalMs < 0 {
+		out.PerAccountMinIntervalMs = 0
+	}
+	// Zero-value bools from older config should still get the intended defaults
+	// unless the user explicitly disables them through the settings API. The API
+	// always writes both booleans, so this only affects first-time migration.
+	if !out.StickyAccount && isEmpty {
+		out.StickyAccount = def.StickyAccount
+	}
+	if !out.OverflowToOtherAccounts && isEmpty {
+		out.OverflowToOtherAccounts = def.OverflowToOtherAccounts
+	}
+	return out
+}
+
+func AutoQuarantineSuspicious429Reason() string {
+	return autoQuarantineSuspicious429Reason
+}
+
+func shouldAutoRestoreSuspendedAccount(a Account, now time.Time) bool {
+	return a.BanStatus == "SUSPENDED" && a.BanReason == autoQuarantineSuspicious429Reason && a.BanTime > 0 && now.Unix()-a.BanTime >= int64(autoQuarantineDuration/time.Second)
+}
+
+func applyAutoRestoreLocked() bool {
+	if cfg == nil {
+		return false
+	}
+	now := time.Now()
+	changed := false
+	for i := range cfg.Accounts {
+		if shouldAutoRestoreSuspendedAccount(cfg.Accounts[i], now) {
+			cfg.Accounts[i].Enabled = true
+			cfg.Accounts[i].BanStatus = "ACTIVE"
+			cfg.Accounts[i].BanReason = ""
+			cfg.Accounts[i].BanTime = 0
+			changed = true
+		}
+	}
+	if changed {
+		_ = Save()
+	}
+	return changed
+}
+
 // Init initializes the configuration system with the specified file path.
 // If the file doesn't exist, a default configuration is created.
 func Init(path string) error {
@@ -257,11 +358,12 @@ func Load() error {
 			// Create default configuration.
 			// Binds to 0.0.0.0 by default for Docker/container compatibility.
 			cfg = &Config{
-				Password:      "changeme",
-				Port:          8080,
-				Host:          "0.0.0.0",
-				RequireApiKey: false,
-				Accounts:      []Account{},
+				Password:           "changeme",
+				Port:               8080,
+				Host:               "0.0.0.0",
+				RequireApiKey:      false,
+				Accounts:           []Account{},
+				RoutingConcurrency: defaultRoutingConcurrencyConfig(),
 			}
 			return saveLocked()
 		}
@@ -273,6 +375,7 @@ func Load() error {
 		return err
 	}
 	cfg = &c
+	cfg.RoutingConcurrency = normalizeRoutingConcurrencyConfig(cfg.RoutingConcurrency)
 
 	// Migration: if a legacy single ApiKey is present and the new ApiKeys list is empty,
 	// promote it into the new structure. The migrated entry inherits the legacy
@@ -398,16 +501,18 @@ func GetHost() string {
 }
 
 func GetAccounts() []Account {
-	cfgLock.RLock()
-	defer cfgLock.RUnlock()
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	applyAutoRestoreLocked()
 	accounts := make([]Account, len(cfg.Accounts))
 	copy(accounts, cfg.Accounts)
 	return accounts
 }
 
 func GetEnabledAccounts() []Account {
-	cfgLock.RLock()
-	defer cfgLock.RUnlock()
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	applyAutoRestoreLocked()
 	var accounts []Account
 	for _, a := range cfg.Accounts {
 		if a.Enabled {
@@ -470,7 +575,11 @@ func SetAccountEnabled(id string, enabled bool) error {
 	for i, a := range cfg.Accounts {
 		if a.ID == id {
 			cfg.Accounts[i].Enabled = enabled
-			if !enabled {
+			if enabled {
+				cfg.Accounts[i].BanStatus = "ACTIVE"
+				cfg.Accounts[i].BanReason = ""
+				cfg.Accounts[i].BanTime = 0
+			} else {
 				cfg.Accounts[i].BanStatus = "DISABLED"
 				cfg.Accounts[i].BanTime = time.Now().Unix()
 			}
@@ -497,6 +606,32 @@ func SetAccountBanStatus(id, status, reason string) error {
 		}
 	}
 	return nil
+}
+
+func SuspendAccountTemporarily(id, reason string) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	now := time.Now().Unix()
+	for i, a := range cfg.Accounts {
+		if a.ID == id {
+			cfg.Accounts[i].Enabled = false
+			cfg.Accounts[i].BanStatus = "SUSPENDED"
+			cfg.Accounts[i].BanReason = reason
+			cfg.Accounts[i].BanTime = now
+			return Save()
+		}
+	}
+	return nil
+}
+
+func ApplyConservativeRoutingProfile() error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	cfg.BalanceMode = "health"
+	cfg.PreferredEndpoint = "kiro"
+	fallback := false
+	cfg.EndpointFallback = &fallback
+	return Save()
 }
 
 func UpdateAccountProfileArn(id, profileArn string) error {
@@ -834,6 +969,50 @@ func UpdateAllowOverUsage(allow bool) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
 	cfg.AllowOverUsage = allow
+	return Save()
+}
+
+// GetBalanceMode returns the configured routing mode. Defaults to "health".
+func GetBalanceMode() string {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil || cfg.BalanceMode == "" {
+		return "health"
+	}
+	switch cfg.BalanceMode {
+	case "health", "managed", "aggressive":
+		return cfg.BalanceMode
+	default:
+		return "health"
+	}
+}
+
+// UpdateBalanceMode sets the routing mode and persists it.
+func UpdateBalanceMode(mode string) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	switch mode {
+	case "health", "managed", "aggressive":
+		cfg.BalanceMode = mode
+	default:
+		cfg.BalanceMode = "health"
+	}
+	return Save()
+}
+
+func GetRoutingConcurrencyConfig() RoutingConcurrencyConfig {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil {
+		return defaultRoutingConcurrencyConfig()
+	}
+	return normalizeRoutingConcurrencyConfig(cfg.RoutingConcurrency)
+}
+
+func UpdateRoutingConcurrencyConfig(rc RoutingConcurrencyConfig) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	cfg.RoutingConcurrency = normalizeRoutingConcurrencyConfig(rc)
 	return Save()
 }
 

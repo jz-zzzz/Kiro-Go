@@ -279,10 +279,10 @@ func RefreshAccountInfo(account *config.Account) (*config.AccountInfo, error) {
 			// Token 相关错误，可能需要重新认证
 			logger.Warnf("[RefreshAccountInfo] Authentication error for %s: %v", account.Email, err)
 
-			// 更新账户封禁状态为认证失败并自动禁用
+			// 更新账户状态为认证失败并自动禁用
 			updatedAccount := *account
 			updatedAccount.Enabled = false
-			updatedAccount.BanStatus = "BANNED"
+			updatedAccount.BanStatus = "DISABLED"
 			updatedAccount.BanReason = "Authentication failed - token invalid or expired"
 			updatedAccount.BanTime = time.Now().Unix()
 
@@ -295,8 +295,9 @@ func RefreshAccountInfo(account *config.Account) (*config.AccountInfo, error) {
 		return nil, fmt.Errorf("GetUsageLimits: %w", err)
 	}
 
-	// 如果成功获取信息，清除封禁状态（如果之前被标记）
-	if account.BanStatus != "" && account.BanStatus != "ACTIVE" {
+	// 如果成功获取信息，清除封禁状态（如果之前被标记）。
+	// 但对本地的 suspicious 429 临时隔离不在这里自动解除，交给配置层按 1 小时规则恢复。
+	if account.BanStatus != "" && account.BanStatus != "ACTIVE" && account.BanReason != "AUTO_QUARANTINE_SUSPICIOUS_429" {
 		logger.Infof("[RefreshAccountInfo] Account %s is now active, clearing ban status", account.Email)
 
 		updatedAccount := *account
@@ -383,8 +384,8 @@ func RefreshAccountInfo(account *config.Account) (*config.AccountInfo, error) {
 }
 
 func parseSubscriptionType(raw string) string {
-	upper := strings.ToUpper(raw)
-	if strings.Contains(upper, "PRO_PLUS") || strings.Contains(upper, "PROPLUS") {
+	upper := strings.ToUpper(strings.TrimSpace(raw))
+	if strings.Contains(upper, "PRO_PLUS") || strings.Contains(upper, "PROPLUS") || strings.Contains(upper, "PRO+") {
 		return "PRO_PLUS"
 	}
 	if strings.Contains(upper, "POWER") {

@@ -290,6 +290,7 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 		var nextContentIndex int
 		var rawContentBuilder strings.Builder
 		var rawThinkingBuilder strings.Builder
+		var firstTokenAt time.Time
 		activeBlockIndex := -1
 		activeBlockType := ""
 
@@ -539,6 +540,9 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 				if text == "" {
 					return
 				}
+				if firstTokenAt.IsZero() {
+					firstTokenAt = time.Now()
+				}
 				if isThinking {
 					rawThinkingBuilder.WriteString(text)
 				} else {
@@ -640,7 +644,11 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 		outputTokens = estimateClaudeOutputTokens(outputContent, thinkingOutput, toolUses)
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
-		recordRequestMetrics("claude", model, true, account, apiKeyID, true, http.StatusOK, "", inputTokens, outputTokens, credits, requestStartedAt)
+		var ttftMs int64
+		if !firstTokenAt.IsZero() {
+			ttftMs = firstTokenAt.Sub(requestStartedAt).Milliseconds()
+		}
+		recordRequestMetrics("claude", model, true, account, apiKeyID, true, http.StatusOK, "", inputTokens, outputTokens, credits, requestStartedAt, ttftMs)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 		h.promptCache.Update(account.ID, cacheProfile)

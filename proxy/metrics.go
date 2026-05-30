@@ -643,9 +643,19 @@ func parseMetricsBucket(raw string, rangeDur time.Duration) time.Duration {
 	}
 }
 
-func recordRequestMetrics(protocol, model string, stream bool, account *config.Account, apiKeyID string, success bool, statusCode int, errorType string, inputTokens, outputTokens int, credits float64, startedAt time.Time) {
+// recordRequestMetrics records a completed request into both the aggregated
+// time-series store and the live request ring buffer.
+//
+// ttftMs is an optional first-token latency (milliseconds). It is variadic so
+// the many non-streaming / early-failure call sites that have no TTFT can keep
+// calling without change; streaming success paths pass the measured value.
+func recordRequestMetrics(protocol, model string, stream bool, account *config.Account, apiKeyID string, success bool, statusCode int, errorType string, inputTokens, outputTokens int, credits float64, startedAt time.Time, ttftMs ...int64) {
 	if startedAt.IsZero() {
 		startedAt = time.Now()
+	}
+	var ttft int64
+	if len(ttftMs) > 0 && ttftMs[0] > 0 {
+		ttft = ttftMs[0]
 	}
 	sample := MetricsSample{
 		Timestamp:    time.Now().Unix(),
@@ -662,6 +672,7 @@ func recordRequestMetrics(protocol, model string, stream bool, account *config.A
 		TotalTokens:  inputTokens + outputTokens,
 		Credits:      credits,
 		LatencyMs:    time.Since(startedAt).Milliseconds(),
+		TTFTMs:       ttft,
 	}
 	if account != nil {
 		sample.AccountID = account.ID

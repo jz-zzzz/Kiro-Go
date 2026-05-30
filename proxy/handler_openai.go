@@ -141,6 +141,7 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 		var realInputTokens int
 		var rawContentBuilder strings.Builder
 		var rawReasoningBuilder strings.Builder
+		var firstTokenAt time.Time
 		var textBuffer string
 		var inThinkingBlock bool
 		var dropTagThinking bool
@@ -358,6 +359,9 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 				if text == "" {
 					return
 				}
+				if firstTokenAt.IsZero() {
+					firstTokenAt = time.Now()
+				}
 				if isThinking {
 					rawReasoningBuilder.WriteString(text)
 				} else {
@@ -456,7 +460,11 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 		}
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
-		recordRequestMetrics("openai", model, true, account, apiKeyID, true, http.StatusOK, "", inputTokens, outputTokens, credits, requestStartedAt)
+		var ttftMs int64
+		if !firstTokenAt.IsZero() {
+			ttftMs = firstTokenAt.Sub(requestStartedAt).Milliseconds()
+		}
+		recordRequestMetrics("openai", model, true, account, apiKeyID, true, http.StatusOK, "", inputTokens, outputTokens, credits, requestStartedAt, ttftMs)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 

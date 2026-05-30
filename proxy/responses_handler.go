@@ -377,6 +377,7 @@ func (h *Handler) handleResponsesStream(
 			outputTokens    int
 			credits         float64
 			realInputTokens int
+			firstTokenAt    time.Time
 		)
 
 		messageItemID := generateOutputItemID("msg")
@@ -416,6 +417,9 @@ func (h *Handler) handleResponsesStream(
 			OnText: func(text string, isThinking bool) {
 				if text == "" {
 					return
+				}
+				if firstTokenAt.IsZero() {
+					firstTokenAt = time.Now()
 				}
 				if isThinking {
 					reasoningText.WriteString(text)
@@ -572,7 +576,11 @@ func (h *Handler) handleResponsesStream(
 		outputTokens = estimateOpenAIOutputTokens(finalContent, reasoning, toolUses)
 
 		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
-		recordRequestMetrics("responses", model, true, account, apiKeyID, true, http.StatusOK, "", inputTokens, outputTokens, credits, requestStartedAt)
+		var ttftMs int64
+		if !firstTokenAt.IsZero() {
+			ttftMs = firstTokenAt.Sub(requestStartedAt).Milliseconds()
+		}
+		recordRequestMetrics("responses", model, true, account, apiKeyID, true, http.StatusOK, "", inputTokens, outputTokens, credits, requestStartedAt, ttftMs)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
 

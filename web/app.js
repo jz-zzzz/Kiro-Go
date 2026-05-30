@@ -40,6 +40,7 @@
   let customSelectRefreshQueued = false;
   let metricsRange = localStorage.getItem('metricsRange') || '24h';
   let lastMetrics = null;
+  let liveTimer = null;
   let currentSettingsTab = localStorage.getItem('settingsSubtab') || 'access';
 
   // DOM helpers
@@ -804,6 +805,114 @@
         '<div class="top-bar"><span style="width:' + pct.toFixed(1) + '%"></span></div>' +
         '</div>';
     }).join('');
+  }
+
+  // Live concurrency panel
+  async function loadLive() {
+    try {
+      const res = await api('/metrics/live?limit=50');
+      if (!res.ok) throw new Error('http ' + res.status);
+      const data = await res.json();
+      renderLive(data);
+    } catch (e) {
+      // Silent: the panel may be polled while logged out or mid-navigation.
+    }
+  }
+  function liveLimitText(v) {
+    const n = Number(v || 0);
+    return n > 0 ? formatNum(n) : '∞';
+  }
+  function renderLive(data) {
+    if (!data) return;
+    const c = data.concurrency || {};
+    setText('liveActive', formatNum(Number(c.active || 0)));
+    setText('liveActiveLimit', liveLimitText(c.maxConcurrent));
+    setText('liveWaiting', formatNum(Number(c.waiting || 0)));
+    setText('liveWaitingLimit', formatNum(Number(c.queueSize || 0)));
+    setText('liveEnqueued', formatNum(Number(c.enqueuedTotal || 0)));
+    setText('liveProcessed', formatNum(Number(c.processedTotal || 0)));
+    setText('liveRejected', formatNum(Number(c.rejectedTotal || 0)));
+    setText('liveTimeout', formatNum(Number(c.timeoutTotal || 0)));
+    renderLiveAccounts(data.perAccount, Number(c.maxConcurrent || 0));
+    renderLiveStream(data.recent);
+  }
+  function renderLiveAccounts(items, globalMax) {
+    const el = $('liveAccounts');
+    if (!el) return;
+    const list = Array.isArray(items) ? items.slice() : [];
+    if (!list.length) {
+      el.innerHTML = '<div class="empty-state">' + escapeHtml(t('live.noActive')) + '</div>';
+      return;
+    }
+    list.sort((a, b) => Number(b.active || 0) - Number(a.active || 0));
+    el.innerHTML = list.map(item => {
+      const active = Number(item.active || 0);
+      const limit = Number(item.limit || 0);
+      const label = item.email || item.accountId || t('metrics.unknown');
+      const denom = limit > 0 ? limit : Math.max(active, 1);
+      const pct = Math.max(6, Math.min(100, active / denom * 100));
+      const full = limit > 0 && active >= limit;
+      return '<div class="live-acct-row">' +
+        '<div class="live-acct-head">' +
+        '<span class="live-acct-email" title="' + escapeAttr(label) + '">' + escapeHtml(label) + '</span>' +
+        '<span class="live-acct-count">' + active + ' / ' + (limit > 0 ? limit : '∞') + '</span>' +
+        '</div>' +
+        '<div class="live-acct-bar' + (full ? ' is-full' : '') + '"><span style="width:' + pct.toFixed(1) + '%"></span></div>' +
+        '</div>';
+    }).join('');
+  }
+  function renderLiveStream(items) {
+    const el = $('liveStream');
+    if (!el) return;
+    const list = Array.isArray(items) ? items : [];
+    if (!list.length) {
+      el.innerHTML = '<div class="empty-state">' + escapeHtml(t('live.noRequests')) + '</div>';
+      return;
+    }
+    el.innerHTML = list.map(item => {
+      const ok = item.success !== false;
+      const ts = Number(item.timestamp || 0);
+      const timeStr = ts ? new Date(ts * 1000).toLocaleTimeString() : '';
+      const model = item.model || t('metrics.unknown');
+      const tags = [];
+      if (item.stream) tags.push('<span class="live-tag live-tag-stream">stream</span>');
+      if (item.protocol) tags.push('<span class="live-tag live-tag-proto">' + escapeHtml(String(item.protocol)) + '</span>');
+      const latency = formatDurationMs(Number(item.latencyMs || 0));
+      const ttft = Number(item.ttftMs || 0);
+      const tps = Number(item.tokensPerSec || 0);
+      const totalTok = Number(item.totalTokens || 0);
+      const nums = [];
+      nums.push('<b>' + latency + '</b>');
+      if (ttft > 0) nums.push('TTFB ' + formatDurationMs(ttft));
+      if (tps > 0) nums.push(tps.toFixed(1) + ' tok/s');
+      nums.push(formatNum(totalTok) + ' tok');
+      let metaLeft = tags.join('');
+      if (!ok) {
+        const errLabel = item.errorType ? String(item.errorType) : ('HTTP ' + (item.statusCode || 0));
+        metaLeft += '<span class="live-tag" style="color:var(--destructive)">' + escapeHtml(errLabel) + '</span>';
+      }
+      return '<div class="live-row' + (ok ? '' : ' is-error') + '">' +
+        '<span class="live-row-time">' + escapeHtml(timeStr) + '</span>' +
+        '<div class="live-row-main">' +
+        '<div class="live-row-model" title="' + escapeAttr(model) + '">' + escapeHtml(model) + '</div>' +
+        '<div class="live-row-meta">' + metaLeft + '</div>' +
+        '</div>' +
+        '<div class="live-row-nums">' + nums.join(' · ') + '</div>' +
+        '</div>';
+    }).join('');
+  }
+  function startLivePolling() {
+    stopLivePolling();
+    const auto = $('liveAutoRefresh');
+    if (auto && !auto.checked) return;
+    liveTimer = setInterval(() => {
+      const onLive = $('tabLive') && !$('tabLive').classList.contains('hidden');
+      const visible = !$('mainPage').classList.contains('hidden');
+      if (onLive && visible) loadLive();
+    }, 3000);
+  }
+  function stopLivePolling() {
+    if (liveTimer) { clearInterval(liveTimer); liveTimer = null; }
   }
 
   // Account list
@@ -3277,6 +3386,12 @@
     qsa('.tab-content').forEach(c => c.classList.add('hidden'));
     $('tab' + tab.charAt(0).toUpperCase() + tab.slice(1)).classList.remove('hidden');
     if (tab === 'metrics') loadMetrics().catch(() => toast(t('metrics.loadFailed'), 'error'));
+    if (tab === 'live') {
+      loadLive();
+      startLivePolling();
+    } else {
+      stopLivePolling();
+    }
   }
 
   // Event wiring
@@ -3327,6 +3442,14 @@
     }
     const metricsRefresh = $('metricsRefreshBtn');
     if (metricsRefresh) metricsRefresh.addEventListener('click', () => loadMetrics().catch(() => toast(t('metrics.loadFailed'), 'error')));
+
+    const liveRefresh = $('liveRefreshBtn');
+    if (liveRefresh) liveRefresh.addEventListener('click', () => loadLive());
+    const liveAuto = $('liveAutoRefresh');
+    if (liveAuto) liveAuto.addEventListener('change', () => {
+      if (liveAuto.checked) startLivePolling();
+      else stopLivePolling();
+    });
 
     qsa('[data-copy]').forEach(btn => btn.addEventListener('click', async () => {
       const id = btn.dataset.copy;

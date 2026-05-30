@@ -107,6 +107,8 @@
                 data-i18n="tabs.settings"></span></button>
             <button type="button" class="tab" data-tab="metrics"><i class="fa-solid fa-chart-line tab-icon"></i><span
                 data-i18n="tabs.metrics"></span></button>
+            <button type="button" class="tab" data-tab="live"><i class="fa-solid fa-gauge-high tab-icon"></i><span
+                data-i18n="tabs.live"></span></button>
             <button type="button" class="tab" data-tab="api"><i class="fa-solid fa-plug tab-icon"></i><span
                 data-i18n="tabs.api"></span></button>
           </div>
@@ -613,6 +615,68 @@
           <div class="card top-card">
             <div class="chart-title" data-i18n="metrics.topApiKeys"></div>
             <div id="topApiKeys" class="top-list"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Live concurrency tab -->
+      <div id="tabLive" class="tab-content hidden">
+        <div class="metrics-toolbar card">
+          <div>
+            <div class="card-title" data-i18n="live.title"></div>
+            <p class="metrics-subtitle" data-i18n="live.subtitle"></p>
+          </div>
+          <div class="metrics-actions">
+            <label class="live-auto"><input type="checkbox" id="liveAutoRefresh" checked /> <span
+                data-i18n="live.autoRefresh"></span></label>
+            <button class="btn btn-outline btn-sm" id="liveRefreshBtn"><i class="fa-solid fa-rotate"></i><span
+                data-i18n="metrics.refresh"></span></button>
+          </div>
+        </div>
+
+        <div class="metrics-grid live-grid">
+          <div class="metric-card">
+            <div class="metric-label" data-i18n="live.active"></div>
+            <div class="metric-value"><span id="liveActive">0</span><span class="metric-limit"> / <span
+                  id="liveActiveLimit">∞</span></span></div>
+            <div class="metric-sub" data-i18n="live.activeSub"></div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-label" data-i18n="live.waiting"></div>
+            <div class="metric-value"><span id="liveWaiting">0</span><span class="metric-limit"> / <span
+                  id="liveWaitingLimit">0</span></span></div>
+            <div class="metric-sub" data-i18n="live.waitingSub"></div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-label" data-i18n="live.enqueued"></div>
+            <div class="metric-value" id="liveEnqueued">0</div>
+            <div class="metric-sub" data-i18n="live.enqueuedSub"></div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-label" data-i18n="live.processed"></div>
+            <div class="metric-value" id="liveProcessed">0</div>
+            <div class="metric-sub" data-i18n="live.processedSub"></div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-label" data-i18n="live.rejected"></div>
+            <div class="metric-value metric-danger" id="liveRejected">0</div>
+            <div class="metric-sub" data-i18n="live.rejectedSub"></div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-label" data-i18n="live.timeout"></div>
+            <div class="metric-value metric-danger" id="liveTimeout">0</div>
+            <div class="metric-sub" data-i18n="live.timeoutSub"></div>
+          </div>
+        </div>
+
+        <div class="live-body">
+          <div class="card live-stream-card">
+            <div class="chart-title" data-i18n="live.streamTitle"></div>
+            <div id="liveStream" class="live-stream"></div>
+          </div>
+          <div class="card live-accounts-card">
+            <div class="chart-title" data-i18n="live.accountsTitle"></div>
+            <div id="liveAccounts" class="live-accounts"></div>
           </div>
         </div>
       </div>

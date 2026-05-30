@@ -185,6 +185,15 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	thinkingCfg := config.GetThinkingConfig()
 	actualModel, thinking := resolveClaudeThinkingMode(req.Model, req.Thinking, thinkingCfg.Suffix)
 	req.Model = actualModel
+
+	// WebSearch server-tool: a pure web_search request is adapted to a Kiro MCP
+	// call and returned as the Anthropic server-tool response.
+	if hasWebSearchTool(&req) {
+		wsInputTokens := estimateClaudeRequestInputTokens(&req)
+		h.handleClaudeWebSearch(r.Context(), w, &req, req.Model, wsInputTokens, apiKeyIDFromContext(r.Context()))
+		return
+	}
+
 	effectiveReq := cloneClaudeRequestForThinking(&req, thinking)
 	thinkingResponseOpts := resolveClaudeThinkingResponseOptions(req.Thinking, thinkingCfg.ClaudeFormat)
 	estimatedInputTokens := estimateClaudeRequestInputTokens(effectiveReq)

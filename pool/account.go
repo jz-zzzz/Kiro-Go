@@ -92,6 +92,10 @@ type AccountPool struct {
 	routeStickyHitTotal    uint64 // had a pin and routed to it (prompt cache reused)
 	routeStickyMissTotal   uint64 // no pin yet: new conversation established one
 	routeStickyDivertTotal uint64 // had a pin but routed elsewhere (busy/unhealthy)
+
+	// routeRequestTotal is incremented on every successful route acquisition,
+	// regardless of sticky status. Used by the live panel to compute RPM.
+	routeRequestTotal uint64
 }
 
 var (
@@ -533,6 +537,7 @@ func (p *AccountPool) getStickyOrNextLocked(model string, excluded map[string]bo
 			if p.canRouteAccountLocked(&p.accounts[i], model, excluded, allowOverUsage, now, true) {
 				p.setStickyLocked(affinityKey, stickyID, now) // refresh TTL
 				atomic.AddUint64(&p.routeStickyHitTotal, 1)
+				atomic.AddUint64(&p.routeRequestTotal, 1)
 				return &p.accounts[i]
 			}
 			break
@@ -546,6 +551,7 @@ func (p *AccountPool) getStickyOrNextLocked(model string, excluded map[string]bo
 		} else {
 			atomic.AddUint64(&p.routeStickyMissTotal, 1)
 		}
+		atomic.AddUint64(&p.routeRequestTotal, 1)
 	}
 	return acc
 }
@@ -614,6 +620,7 @@ func (p *AccountPool) tryAcquireForModel(model string, excluded map[string]bool,
 				if acc != nil || !rc.OverflowToOtherAccounts {
 					if acc != nil {
 						atomic.AddUint64(&p.routeStickyHitTotal, 1)
+						atomic.AddUint64(&p.routeRequestTotal, 1)
 					}
 					return routingTryResult{account: copyAccount(acc), busy: acc == nil, wait: earliestWait, notify: p.routeNotify}, nil
 				}
@@ -648,6 +655,7 @@ func (p *AccountPool) tryAcquireForModel(model string, excluded map[string]bool,
 					atomic.AddUint64(&p.routeStickyMissTotal, 1)
 				}
 			}
+			atomic.AddUint64(&p.routeRequestTotal, 1)
 			return routingTryResult{account: copyAccount(selected)}, nil
 		}
 	}
@@ -701,6 +709,7 @@ func (p *AccountPool) RoutingStats() map[string]interface{} {
 		"stickyHitTotal":    atomic.LoadUint64(&p.routeStickyHitTotal),
 		"stickyMissTotal":   atomic.LoadUint64(&p.routeStickyMissTotal),
 		"stickyDivertTotal": atomic.LoadUint64(&p.routeStickyDivertTotal),
+		"requestTotal":      atomic.LoadUint64(&p.routeRequestTotal),
 	}
 }
 

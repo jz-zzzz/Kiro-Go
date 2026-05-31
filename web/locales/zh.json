@@ -608,6 +608,8 @@
   "live.rejectedSub": "因队列已满被拒绝的请求数",
   "live.timeout": "超时",
   "live.timeoutSub": "排队等待超时的请求数",
+  "live.requestsPerMinute": "RPM",
+  "live.requestsPerMinuteSub": "每分钟路由请求数",
   "live.stickyHitRate": "粘性命中率",
   "live.stickyBreakdown": "命中 {hit} · 新建 {miss} · 偏离 {divert}",
   "live.stickyDisabled": "粘性路由未启用",

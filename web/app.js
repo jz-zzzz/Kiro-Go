@@ -40,6 +40,7 @@
   let customSelectRefreshQueued = false;
   let metricsRange = localStorage.getItem('metricsRange') || '24h';
   let lastMetrics = null;
+  let prevRequestTotal = 0; // for RPM calculation in live panel
   let liveTimer = null;
   let currentSettingsTab = localStorage.getItem('settingsSubtab') || 'access';
 
@@ -855,6 +856,11 @@
     setText('liveProcessed', formatNum(Number(c.processedTotal || 0)));
     setText('liveRejected', formatNum(Number(c.rejectedTotal || 0)));
     setText('liveTimeout', formatNum(Number(c.timeoutTotal || 0)));
+    // RPM: delta since last poll, scaled to per-minute
+    const total = Number(c.requestTotal || 0);
+    const rpm = prevRequestTotal > 0 ? Math.round((total - prevRequestTotal) * 20) : 0;
+    prevRequestTotal = total;
+    setText('liveRpm', rpm > 0 ? formatNum(rpm) : '—');
     renderLiveSticky(data.sticky);
     renderLiveAccounts(data.perAccount, Number(c.maxConcurrent || 0));
     renderLiveStream(data.recent);

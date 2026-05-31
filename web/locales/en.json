@@ -608,6 +608,8 @@
   "live.rejectedSub": "Requests rejected because the queue was full",
   "live.timeout": "Timeout",
   "live.timeoutSub": "Requests that timed out while queued",
+  "live.requestsPerMinute": "RPM",
+  "live.requestsPerMinuteSub": "Requests routed per minute",
   "live.stickyHitRate": "Sticky Hit Rate",
   "live.stickyBreakdown": "Hit {hit} · New {miss} · Divert {divert}",
   "live.stickyDisabled": "Sticky routing disabled",

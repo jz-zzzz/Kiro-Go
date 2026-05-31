@@ -232,6 +232,7 @@ func (h *Handler) apiMetricsLive(w http.ResponseWriter, r *http.Request) {
 		"processedTotal": stats["processedTotal"],
 		"rejectedTotal":  stats["rejectedTotal"],
 		"timeoutTotal":   stats["timeoutTotal"],
+		"requestTotal":   stats["requestTotal"],
 	}
 
 	// Sticky (conversation affinity) outcomes. hitRate is over affinity-keyed

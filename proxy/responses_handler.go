@@ -136,6 +136,14 @@ func (h *Handler) handleResponsesNonStream(
 	excluded := make(map[string]bool)
 	var lastErr error
 	var lastAccount *config.Account
+	// Panic safety net: guarantees the routing slot is released even if a panic
+	// unwinds the stack. release is sync.Once-idempotent.
+	var activeRelease func()
+	defer func() {
+		if activeRelease != nil {
+			activeRelease()
+		}
+	}()
 
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
 		account, release, acquireErr := h.acquireRouteAccount(ctx, model, excluded, apiKeyID)
@@ -149,6 +157,7 @@ func (h *Handler) handleResponsesNonStream(
 			}
 			break
 		}
+		activeRelease = release
 		if err := h.ensureValidToken(account); err != nil {
 			release()
 			lastErr = err
@@ -337,6 +346,14 @@ func (h *Handler) handleResponsesStream(
 	var lastErr error
 	var lastAccount *config.Account
 	responseStarted := false
+	// Panic safety net: guarantees the routing slot is released even if a panic
+	// unwinds the stack. release is sync.Once-idempotent.
+	var activeRelease func()
+	defer func() {
+		if activeRelease != nil {
+			activeRelease()
+		}
+	}()
 
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
 		account, release, acquireErr := h.acquireRouteAccount(ctx, model, excluded, apiKeyID)
@@ -357,6 +374,7 @@ func (h *Handler) handleResponsesStream(
 			}
 			break
 		}
+		activeRelease = release
 		if err := h.ensureValidToken(account); err != nil {
 			release()
 			lastErr = err

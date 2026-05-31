@@ -113,6 +113,17 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 	excluded := make(map[string]bool)
 	var lastErr error
 	var lastAccount *config.Account
+	// activeRelease is a panic safety net: release is sync.Once-idempotent, so
+	// the manual release() calls below still drive normal failover, while this
+	// deferred call guarantees the routing slot is freed even if a panic unwinds
+	// the stack (net/http would otherwise recover without releasing the slot,
+	// leaking the concurrency counter and eventually deadlocking routing).
+	var activeRelease func()
+	defer func() {
+		if activeRelease != nil {
+			activeRelease()
+		}
+	}()
 
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
 		account, release, acquireErr := h.acquireRouteAccount(ctx, model, excluded, apiKeyID)
@@ -127,6 +138,7 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 			}
 			break
 		}
+		activeRelease = release
 		if err := h.ensureValidToken(account); err != nil {
 			release()
 			lastErr = err
@@ -535,6 +547,14 @@ func (h *Handler) handleOpenAINonStream(ctx context.Context, w http.ResponseWrit
 	excluded := make(map[string]bool)
 	var lastErr error
 	var lastAccount *config.Account
+	// Panic safety net (see handleOpenAIStream): guarantees the routing slot is
+	// released even if a panic unwinds the stack. release is sync.Once-idempotent.
+	var activeRelease func()
+	defer func() {
+		if activeRelease != nil {
+			activeRelease()
+		}
+	}()
 
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
 		account, release, acquireErr := h.acquireRouteAccount(ctx, model, excluded, apiKeyID)
@@ -549,6 +569,7 @@ func (h *Handler) handleOpenAINonStream(ctx context.Context, w http.ResponseWrit
 			}
 			break
 		}
+		activeRelease = release
 		if err := h.ensureValidToken(account); err != nil {
 			release()
 			lastErr = err

@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"kiro-go/config"
 	"net/http"
@@ -17,7 +18,11 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if password != config.GetPassword() {
+	// Reject when no admin password is configured: otherwise an empty configured
+	// password would make "" == "" true and let unauthenticated requests through
+	// (fail-open). Use a constant-time comparison to avoid a timing side channel.
+	expected := config.GetPassword()
+	if expected == "" || subtle.ConstantTimeCompare([]byte(password), []byte(expected)) != 1 {
 		w.WriteHeader(401)
 		json.NewEncoder(w).Encode(map[string]string{"error": "Unauthorized"})
 		return

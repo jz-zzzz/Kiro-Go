@@ -2,6 +2,7 @@ package config
 
 import (
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/hex"
 	"errors"
 	"strings"
@@ -138,7 +139,8 @@ func FindApiKeyByValue(key string) *ApiKeyEntry {
 		return nil
 	}
 	for i := range cfg.ApiKeys {
-		if cfg.ApiKeys[i].Key == key {
+		// Constant-time comparison to avoid a timing side channel on the key value.
+		if subtle.ConstantTimeCompare([]byte(cfg.ApiKeys[i].Key), []byte(key)) == 1 {
 			cp := cfg.ApiKeys[i]
 			return &cp
 		}

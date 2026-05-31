@@ -231,7 +231,10 @@
               <button class="view-toggle-btn" type="button" data-view-mode="list" data-i18n="accounts.viewList"></button>
             </div>
             <div class="filter-grid">
-              <input type="text" id="filterSearch" data-i18n-placeholder="filter.search" />
+              <div class="search-wrap">
+                <input type="text" id="filterSearch" data-i18n-placeholder="filter.search" />
+                <button type="button" class="search-clear" id="filterSearchClear" aria-label="Clear" tabindex="-1"><i class="fa-solid fa-xmark"></i></button>
+              </div>
               <select id="filterStatusSelect" data-i18n-aria-label="filter.status">
                 <option value="all" data-i18n="filter.all"></option>
                 <option value="ready" data-i18n="filter.ready"></option>
@@ -310,7 +313,10 @@
               <button class="view-toggle-btn" type="button" data-apikey-view-mode="card" data-i18n="apiKeys.viewCard"></button>
             </div>
             <div class="filter-grid apikeys-filter-grid">
-              <input type="text" id="apiKeyFilterSearch" data-i18n-placeholder="apiKeys.filterSearch" />
+              <div class="search-wrap">
+                <input type="text" id="apiKeyFilterSearch" data-i18n-placeholder="apiKeys.filterSearch" />
+                <button type="button" class="search-clear" id="apiKeyFilterSearchClear" aria-label="Clear" tabindex="-1"><i class="fa-solid fa-xmark"></i></button>
+              </div>
               <select id="apiKeyFilterStatusSelect" data-i18n-aria-label="apiKeys.filterStatus">
                 <option value="all" data-i18n="apiKeys.filterAll"></option>
                 <option value="enabled" data-i18n="apiKeys.filterEnabled"></option>

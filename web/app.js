@@ -54,6 +54,26 @@
   function escapeAttr(s) {
     return escapeHtml(s).replace(/"/g, '&quot;');
   }
+  function debounce(fn, ms) {
+    let timer = null;
+    return function (...args) {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => { timer = null; fn.apply(this, args); }, ms);
+    };
+  }
+  async function concurrentMap(arr, concurrency, fn) {
+    const results = [];
+    let nextIdx = 0;
+    async function worker() {
+      while (nextIdx < arr.length) {
+        const idx = nextIdx++;
+        results[idx] = await fn(arr[idx], idx);
+      }
+    }
+    const workers = Array.from({ length: Math.min(concurrency, arr.length) }, worker);
+    await Promise.allSettled(workers);
+    return results;
+  }
   async function copyText(text) {
     if (navigator.clipboard && navigator.clipboard.writeText) {
       try {
@@ -514,6 +534,8 @@
     modalFocusStack.push({ id, el: document.activeElement });
     modal.removeEventListener('keydown', trapDialogFocus);
     modal.addEventListener('keydown', trapDialogFocus);
+    const escHandler = e => { if (e.key === 'Escape') { closeDialog(id); modal.removeEventListener('keydown', escHandler); } };
+    modal.addEventListener('keydown', escHandler);
     modal.classList.add('active');
     lockModalScroll();
     focusDialog(modal);
@@ -1669,14 +1691,15 @@
     });
     if (!confirmed) return;
     const dismiss = toast(t('detail.refreshModelCache') + '…', 'info', { duration: 0 });
-    let ok = 0, fail = 0;
-    for (const id of ids) {
+    const results = await concurrentMap(ids, 5, async (id) => {
       try {
         const res = await api('/accounts/' + encodeURIComponent(id) + '/models/refresh', { method: 'POST' });
         const d = await res.json();
-        if (d.success) ok++; else fail++;
-      } catch { fail++; }
-    }
+        return d.success;
+      } catch { return false; }
+    });
+    let ok = results.filter(Boolean).length;
+    let fail = results.length - ok;
     dismiss();
     toast(t('batch.refreshModelsResult', ok, fail), fail ? 'warning' : 'success');
     selectedAccounts.clear();
@@ -1701,28 +1724,29 @@
     });
     if (!confirmed) return;
     let dismiss = toast(t('batch.testingAuto', 0, ids.length), 'info', { duration: 0 });
-    let ok = 0, fail = 0;
+    let completed = 0;
     const failures = [];
-    for (let i = 0; i < ids.length; i++) {
-      const id = ids[i];
+    const results = await concurrentMap(ids, 5, async (id) => {
       try {
-        dismiss = updateToast(dismiss, t('batch.testingAuto', i + 1, ids.length));
+        completed++;
+        dismiss = updateToast(dismiss, t('batch.testingAuto', completed, ids.length));
         const res = await api('/accounts/' + encodeURIComponent(id) + '/test', {
           method: 'POST',
           body: JSON.stringify({})
         });
         const d = await res.json().catch(() => ({}));
         if (res.ok && d.success) {
-          ok++;
+          return { ok: true };
         } else {
-          fail++;
-          failures.push({ id, error: d.error || ('HTTP ' + res.status) });
+          return { ok: false, error: d.error || ('HTTP ' + res.status) };
         }
       } catch (e) {
-        fail++;
-        failures.push({ id, error: (e && e.message) || String(e) });
+        return { ok: false, error: (e && e.message) || String(e) };
       }
-    }
+    });
+    let ok = results.filter(r => r && r.ok).length;
+    let fail = results.length - ok;
+    results.filter(r => r && !r.ok).forEach(r => failures.push({ error: r.error }));
     dismiss();
     const summary = skipped > 0 ? t('batch.testAutoResultSkipped', ok, fail, skipped) : t('batch.testAutoResult', ok, fail);
     if (failures.length) {
@@ -1745,14 +1769,15 @@
     });
     if (!confirmed) return;
     const dismiss = toast(t('batch.deleting'), 'info', { duration: 0 });
-    let ok = 0, fail = 0;
-    for (const id of ids) {
+    const results = await concurrentMap(ids, 3, async (id) => {
       try {
         const res = await api('/accounts/' + id, { method: 'DELETE' });
         const d = await res.json().catch(() => ({}));
-        if (res.ok && d.success !== false) ok++; else fail++;
-      } catch { fail++; }
-    }
+        return res.ok && d.success !== false;
+      } catch { return false; }
+    });
+    let ok = results.filter(Boolean).length;
+    let fail = results.length - ok;
     dismiss();
     toast(t('batch.deleteResult', ok, fail), fail ? 'warning' : 'success', { icon: 'fa-solid fa-trash' });
     selectedAccounts.clear();
@@ -2768,9 +2793,13 @@
     bindDialogBackdropClose('apiKeyShowModal', closeShowApiKeyModal);
 
     const search = $('apiKeyFilterSearch');
-    if (search) search.addEventListener('input', () => {
+    if (search) search.addEventListener('input', debounce(() => {
       apiKeyFilterKeyword = search.value || '';
       renderApiKeys();
+    }, 150));
+    const apikeyClear = $('apiKeyFilterSearchClear');
+    if (apikeyClear) apikeyClear.addEventListener('click', () => {
+      if (search) { search.value = ''; search.focus(); apiKeyFilterKeyword = ''; renderApiKeys(); }
     });
     const statusSel = $('apiKeyFilterStatusSelect');
     if (statusSel) statusSel.addEventListener('change', () => {
@@ -2858,7 +2887,7 @@
   }
 
   // Add-account modal templates
-  var METHOD_ICONS = {
+  const METHOD_ICONS = {
     builderid: 'fa-solid fa-id-card',
     iam: 'fa-solid fa-key',
     sso: 'fa-solid fa-shield-halved',
@@ -3310,9 +3339,11 @@
   }
 
   // Export modal
+  let exportDataCache = null;
   function showExportModal() {
     if (!accountsData.length) return toastWarning(t('accounts.empty'));
     exportSelectedIds = new Set(accountsData.map(a => a.id));
+    exportDataCache = null;
     renderExportModal();
     openDialog('exportModal');
   }
@@ -3347,6 +3378,7 @@
     $('exportToggleAllBtn').addEventListener('click', () => {
       if (exportSelectedIds.size === accountsData.length) exportSelectedIds.clear();
       else exportSelectedIds = new Set(accountsData.map(a => a.id));
+      exportDataCache = null;
       renderExportModal();
     });
     $('exportCloseBtn').addEventListener('click', closeExportModal);
@@ -3357,18 +3389,21 @@
       const id = e.target.dataset.exportToggle;
       if (exportSelectedIds.has(id)) exportSelectedIds.delete(id);
       else exportSelectedIds.add(id);
+      exportDataCache = null;
       renderExportModal();
     }));
   }
   async function getExportData() {
     if (exportSelectedIds.size === 0) { toastWarning(t('export.noSelection')); return null; }
+    if (exportDataCache) return exportDataCache;
     const res = await api('/export', { method: 'POST', body: JSON.stringify({ ids: Array.from(exportSelectedIds) }) });
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
       toastError(t('common.failed') + ': ' + (err.error || t('common.unknownError')));
       return null;
     }
-    return res.json();
+    exportDataCache = await res.json();
+    return exportDataCache;
   }
   async function exportShowJson() {
     const data = await getExportData();
@@ -3642,7 +3677,12 @@
     qsa('[data-view-mode]').forEach(btn => btn.addEventListener('click', () => setAccountsViewMode(btn.dataset.viewMode)));
     renderAccountsViewToggle();
 
-    $('filterSearch').addEventListener('input', onFilterChange);
+    $('filterSearch').addEventListener('input', debounce(onFilterChange, 150));
+    const filterClear = $('filterSearchClear');
+    if (filterClear) filterClear.addEventListener('click', () => {
+      const input = $('filterSearch');
+      if (input) { input.value = ''; input.focus(); onFilterChange(); }
+    });
     ['filterStatusSelect', 'filterTierSelect', 'filterProxySelect', 'filterSortSelect'].forEach(id => {
       const el = $(id);
       if (el) el.addEventListener('change', onFilterChange);
@@ -3795,8 +3835,13 @@
     if (yr) yr.textContent = new Date().getFullYear();
     wireEvents();
     if (password) tryAutoLogin();
+    let pageVisible = !document.hidden;
+    document.addEventListener('visibilitychange', () => {
+      pageVisible = !document.hidden;
+      if (pageVisible) { loadStats(); loadAccounts().catch(() => {}); }
+    });
     setInterval(() => {
-      if ($('mainPage').classList.contains('hidden')) return;
+      if ($('mainPage').classList.contains('hidden') || !pageVisible) return;
       loadStats();
       // 账号 tab 可见时同步刷新账号卡片，使请求数/429率/冷却状态保持最新。
       const accountsTab = $('tabAccounts');

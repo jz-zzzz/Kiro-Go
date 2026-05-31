@@ -148,6 +148,7 @@ body {
   font-feature-settings: "cv02", "cv03", "cv04", "cv11";
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+  transition: background-color 0.3s ease, color 0.3s ease;
 }
 
 html {
@@ -3059,8 +3060,8 @@ img.brand-icon {
   height: 1.5rem;
   padding: 0 0.5rem;
   border-radius: 9999px;
-  background: #2563eb;
-  color: #ffffff;
+  background: var(--primary);
+  color: var(--primary-foreground);
   font-size: 0.8125rem;
   font-weight: 700;
   line-height: 1;
@@ -3552,6 +3553,42 @@ img.brand-icon {
 .filter-grid select,
 .filter-grid .custom-select {
   width: 100% !important;
+}
+.search-wrap {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+.search-wrap input {
+  padding-right: 1.75rem !important;
+}
+.search-clear {
+  position: absolute;
+  right: 0.25rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.25rem;
+  height: 1.25rem;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--muted-foreground);
+  font-size: 0.8125rem;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.15s, background-color 0.15s;
+}
+.search-wrap:hover .search-clear,
+.search-wrap .search-clear:focus-visible {
+  opacity: 1;
+}
+.search-clear:hover {
+  background: var(--muted);
+}
+.search-clear:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 1px;
 }
 .view-toggle {
   display: inline-flex;

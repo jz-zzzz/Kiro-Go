@@ -434,6 +434,25 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 			h.recordFailure()
 			statusCode, errType := metricsErrorDetails(err, http.StatusInternalServerError, "api_error")
 			recordRequestMetrics("openai", model, true, account, apiKeyID, false, statusCode, errType, estimatedInputTokens, outputTokens, credits, requestStartedAt)
+			// Output already started: we cannot change the HTTP status now, but
+			// we must still close the SSE stream cleanly. Emit a terminating
+			// chunk with finish_reason + [DONE] so clients don't hang waiting.
+			closeChunk := map[string]interface{}{
+				"id":      chatID,
+				"object":  "chat.completion.chunk",
+				"created": time.Now().Unix(),
+				"model":   model,
+				"choices": []map[string]interface{}{{
+					"index":         0,
+					"delta":         map[string]interface{}{},
+					"finish_reason": "stop",
+				}},
+			}
+			if data, mErr := json.Marshal(closeChunk); mErr == nil {
+				fmt.Fprintf(w, "data: %s\n\n", string(data))
+			}
+			fmt.Fprintf(w, "data: [DONE]\n\n")
+			flusher.Flush()
 			return
 		}
 

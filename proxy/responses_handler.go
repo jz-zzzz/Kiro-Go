@@ -533,6 +533,10 @@ func (h *Handler) handleResponsesStream(
 					},
 				},
 			})
+			// Match the success path: terminate the SSE stream with [DONE] so
+			// clients stop reading instead of hanging.
+			fmt.Fprintf(w, "data: [DONE]\n\n")
+			flusher.Flush()
 			h.recordFailure()
 			return
 		}

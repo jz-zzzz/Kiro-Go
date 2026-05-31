@@ -31,6 +31,23 @@ func (h *Handler) apiClear429Probes(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (h *Handler) apiGetUpstreamErrorProbes(w http.ResponseWriter, r *http.Request) {
+	logs := getUpstreamErrorProbeLogs()
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"ttlSeconds": int64(upstreamErrorProbeTTL / time.Second),
+		"count":      len(logs),
+		"items":      logs,
+	})
+}
+
+func (h *Handler) apiClearUpstreamErrorProbes(w http.ResponseWriter, r *http.Request) {
+	count := clearUpstreamErrorProbeLogs()
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"cleared": count,
+	})
+}
+
 func (h *Handler) apiGetAccounts(w http.ResponseWriter, r *http.Request) {
 	accounts := config.GetAccounts()
 	poolAccounts := h.pool.GetAllAccounts()
@@ -192,6 +209,19 @@ func (h *Handler) apiUpdateAccount(w http.ResponseWriter, r *http.Request, id st
 	oldEnabled := existing.Enabled
 	if v, ok := updates["enabled"].(bool); ok {
 		existing.Enabled = v
+		// Keep BanStatus in sync with an explicit operator toggle. A manual
+		// disable must be marked DISABLED (not left as SUSPENDED), otherwise the
+		// auto-429 restore sweep re-enables the account once its quarantine
+		// window elapses — silently undoing the operator's action.
+		if v {
+			existing.BanStatus = "ACTIVE"
+			existing.BanReason = ""
+			existing.BanTime = 0
+		} else {
+			existing.BanStatus = "DISABLED"
+			existing.BanReason = config.OperatorDisabledReason()
+			existing.BanTime = time.Now().Unix()
+		}
 	}
 	if v, ok := updates["nickname"].(string); ok {
 		existing.Nickname = v
@@ -350,6 +380,12 @@ func (h *Handler) apiBatchAccounts(w http.ResponseWriter, r *http.Request) {
 					a.BanStatus = "ACTIVE"
 					a.BanReason = ""
 					a.BanTime = 0
+				} else if !enabled {
+					// Mark a manual disable as DISABLED so the auto-429 restore
+					// sweep can't silently re-enable it later.
+					a.BanStatus = "DISABLED"
+					a.BanReason = config.OperatorDisabledReason()
+					a.BanTime = time.Now().Unix()
 				}
 				config.UpdateAccount(a.ID, a)
 			}

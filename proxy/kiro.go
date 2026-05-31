@@ -433,6 +433,11 @@ func CallKiroAPI(ctx context.Context, account *config.Account, payload *KiroPayl
 		if err != nil {
 			lastErr = err
 			logger.Warnf("[KiroAPI] Endpoint %s failed: %v", ep.Name, err)
+			// Skip client-initiated cancellation/timeout: that is not an upstream
+			// fault and would otherwise flood the probe store with client noise.
+			if !isClientDisconnectError(ctx, err) {
+				recordUpstreamErrorProbe(ep.Name, "connect", 0, currentMessageModelID(payload), account, err.Error())
+			}
 			continue
 		}
 
@@ -450,7 +455,9 @@ func CallKiroAPI(ctx context.Context, account *config.Account, payload *KiroPayl
 		if resp.StatusCode != 200 {
 			errBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
-			lastErr = &KiroAPIError{StatusCode: resp.StatusCode, Endpoint: ep.Name, Body: strings.TrimSpace(string(errBody))}
+			body := strings.TrimSpace(string(errBody))
+			lastErr = &KiroAPIError{StatusCode: resp.StatusCode, Endpoint: ep.Name, Body: body}
+			recordUpstreamErrorProbe(ep.Name, "response", resp.StatusCode, currentMessageModelID(payload), account, body)
 			// Authentication errors and payment errors are not retried across endpoints.
 			if resp.StatusCode == 401 || resp.StatusCode == 403 || resp.StatusCode == 402 {
 				return lastErr
@@ -461,6 +468,13 @@ func CallKiroAPI(ctx context.Context, account *config.Account, payload *KiroPayl
 
 		err = parseEventStream(ctx, resp.Body, callback)
 		resp.Body.Close()
+		// A mid-stream failure (response began 200 then the event stream broke)
+		// is otherwise invisible: it surfaces to clients only as a generic
+		// "api_error" with no upstream detail. Persist it, but skip client
+		// disconnects so the probe store reflects upstream faults only.
+		if err != nil && !isClientDisconnectError(ctx, err) {
+			recordUpstreamErrorProbe(ep.Name, "stream", 200, currentMessageModelID(payload), account, err.Error())
+		}
 		return err
 	}
 

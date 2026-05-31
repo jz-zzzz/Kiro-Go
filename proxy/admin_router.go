@@ -127,6 +127,10 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiGet429Probes(w, r)
 	case path == "/429-probes/clear" && r.Method == "POST":
 		h.apiClear429Probes(w, r)
+	case path == "/upstream-errors" && r.Method == "GET":
+		h.apiGetUpstreamErrorProbes(w, r)
+	case path == "/upstream-errors/clear" && r.Method == "POST":
+		h.apiClearUpstreamErrorProbes(w, r)
 	case path == "/export" && r.Method == "POST":
 		h.apiExportAccounts(w, r)
 	case path == "/api-keys" && r.Method == "GET":

@@ -3969,7 +3969,7 @@ img.brand-icon {
 .apikey-list-head,
 .apikey-list-row {
   display: grid;
-  grid-template-columns: minmax(8rem, 1.6fr) minmax(7rem, 1fr) 6rem 4.5rem minmax(6.5rem, 1fr) minmax(6.5rem, 1fr) minmax(11rem, auto);
+  grid-template-columns: minmax(7rem, 1.3fr) minmax(7rem, 1fr) 6rem 4.5rem minmax(7.5rem, 1.1fr) minmax(7.5rem, 1.1fr) minmax(11rem, auto);
   gap: 0.5rem;
   align-items: center;
   width: 100%;
@@ -4111,6 +4111,35 @@ img.brand-icon {
   flex-wrap: wrap;
 }
 
+/* Live sliding-window selector (segmented 1m / 5m toggle). */
+.live-window-toggle {
+  display: inline-flex;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+  background: var(--card);
+}
+.live-window-btn {
+  border: 0;
+  background: transparent;
+  color: var(--muted-foreground);
+  font-size: 0.78rem;
+  font-weight: 600;
+  padding: 0.35rem 0.7rem;
+  cursor: pointer;
+  transition: background-color 0.15s, color 0.15s;
+}
+.live-window-btn + .live-window-btn {
+  border-left: 1px solid var(--border);
+}
+.live-window-btn:hover {
+  background: color-mix(in oklab, var(--primary) 6%, var(--card));
+}
+.live-window-btn.is-active {
+  background: var(--primary);
+  color: var(--primary-foreground, #fff);
+}
+
 .metrics-select {
   min-width: 9rem;
 }
@@ -4184,12 +4213,65 @@ img.brand-icon {
 }
 
 .metric-chart {
+  position: relative;
   width: 100%;
   min-height: 190px;
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
   background: color-mix(in srgb, var(--muted) 55%, transparent);
   overflow: hidden;
+}
+
+.chart-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 190px;
+  color: var(--muted-foreground);
+  font-size: 0.85rem;
+}
+
+.chart-hover-line {
+  stroke: var(--muted-foreground);
+  stroke-width: 1;
+  stroke-dasharray: 3 3;
+  opacity: 0.6;
+  pointer-events: none;
+}
+
+.chart-hover-dot {
+  pointer-events: none;
+  stroke: var(--card);
+  stroke-width: 1.5;
+}
+
+.chart-tooltip {
+  position: absolute;
+  top: 8px;
+  transform: translateX(-50%);
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: 0.3rem 0.5rem;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.18);
+  pointer-events: none;
+  white-space: nowrap;
+  z-index: 2;
+}
+
+.chart-tooltip-val {
+  font-weight: 700;
+  font-size: 0.8rem;
+  color: var(--card-foreground);
+}
+
+.chart-tooltip-time {
+  font-size: 0.7rem;
+  font-family: var(--font-mono);
+  color: var(--muted-foreground);
 }
 
 .metric-chart svg {
@@ -4367,7 +4449,7 @@ img.brand-icon {
 
 .live-row {
   display: grid;
-  grid-template-columns: 72px 1fr auto;
+  grid-template-columns: 72px minmax(0, 1fr) minmax(0, auto);
   gap: 0.6rem;
   align-items: center;
   padding: 0.5rem 0.65rem;
@@ -4420,13 +4502,14 @@ img.brand-icon {
 .live-tag-stream { color: #2563eb; border-color: color-mix(in srgb, #2563eb 40%, var(--border)); }
 .live-tag-think { color: #7c3aed; border-color: color-mix(in srgb, #7c3aed 40%, var(--border)); }
 .live-tag-proto { color: var(--muted-foreground); }
+.live-tag-acct { color: #0d9488; border-color: color-mix(in srgb, #0d9488 35%, var(--border)); text-transform: none; }
 
 .live-row-nums {
   text-align: right;
   font-family: var(--font-mono);
   font-size: 0.74rem;
   color: var(--muted-foreground);
-  white-space: nowrap;
+  overflow-wrap: anywhere;
 }
 
 .live-row-nums b {

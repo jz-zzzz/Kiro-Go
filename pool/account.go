@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"kiro-go/config"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -25,6 +26,34 @@ type requestEvent struct {
 	at      time.Time
 	is429   bool
 	isError bool
+}
+
+// routeSampleWindow bounds how long routing-decision samples are retained. It
+// must cover the largest selectable live window (5min) plus headroom so
+// sliding-window aggregation never runs short of data.
+const routeSampleWindow = 6 * time.Minute
+
+type routeSampleKind uint8
+
+const (
+	routeSampleProcessed routeSampleKind = iota // successfully acquired a route slot
+	routeSampleEnqueued                          // had to wait in the queue at least once
+	routeSampleRejected                          // rejected because the queue was full
+	routeSampleTimeout                           // timed out while waiting in the queue
+)
+
+// routeSample is a single routing-decision event with the gauge snapshot taken
+// at the moment it occurred. Sliding-window aggregation derives windowed
+// counters, per-account request counts and active/waiting peaks from these.
+type routeSample struct {
+	at           time.Time
+	kind         routeSampleKind
+	accountID    string // selected account (routeSampleProcessed only)
+	stickyHit    bool
+	stickyMiss   bool
+	stickyDivert bool
+	active       int // global active snapshot after increment (routeSampleProcessed)
+	waiting      int // global waiting snapshot after increment (routeSampleEnqueued)
 }
 
 type AccountHealthSnapshot struct {
@@ -96,6 +125,10 @@ type AccountPool struct {
 	// routeRequestTotal is incremented on every successful route acquisition,
 	// regardless of sticky status. Used by the live panel to compute RPM.
 	routeRequestTotal uint64
+
+	// routeSamples is a rolling log of routing-decision events (last
+	// routeSampleWindow) used for sliding-window live metrics. Guarded by mu.
+	routeSamples []routeSample
 }
 
 var (
@@ -269,6 +302,94 @@ func copyAccount(acc *config.Account) *config.Account {
 	return &cp
 }
 
+// effectiveUsageFraction reports how "full" an account is on a 0..1+ scale.
+// When overage is in effect (global AllowOverUsage on, or the account's upstream
+// OverageStatus=ENABLED) the fraction is measured against the *total* budget
+// (subscription limit + overage cap) rather than the subscription limit alone.
+// This prevents an account that exceeded its subscription quota but still has
+// plenty of overage headroom (e.g. 3118/1000 subscription == 312%, yet only
+// 28% of a 1000+10000 total budget) from being treated as full.
+func effectiveUsageFraction(acc config.Account, allowOverUsage bool) float64 {
+	if acc.UsageLimit <= 0 {
+		return 0 // unknown / unlimited → treat as empty
+	}
+	budget := acc.UsageLimit
+	if (allowOverUsage || strings.EqualFold(acc.OverageStatus, "ENABLED")) && acc.OverageCap > 0 {
+		budget = acc.UsageLimit + acc.OverageCap
+	}
+	return acc.UsageCurrent / budget
+}
+
+// modeRankLocked returns a preference score for acc under the given balance
+// mode; higher means the account should be picked sooner. Only "aggressive" and
+// "health" use ranking — "managed" keeps plain weighted round-robin and never
+// calls this. Caller must hold the pool lock (reads runtime maps).
+func (p *AccountPool) modeRankLocked(acc *config.Account, mode string, allowOverUsage bool, now time.Time) float64 {
+	switch mode {
+	case "aggressive":
+		// Concentrate load: prefer the account that is most utilized but still
+		// has headroom, so one account fills up before spilling to the next.
+		frac := effectiveUsageFraction(*acc, allowOverUsage)
+		if frac >= 1.0 {
+			return -frac // genuinely full: rank below every account with headroom
+		}
+		return frac
+	case "health":
+		// Spread load to the healthiest/emptiest account.
+		reqs, qe, rate := p.getRecentStatsLocked(acc.ID, now)
+		return float64(p.computeHealthScoreLocked(acc, reqs, qe, rate, now))
+	default:
+		return 0
+	}
+}
+
+// candidateOrderLocked returns indices into p.accounts in the order they should
+// be tried for the given balance mode, de-duplicated by account ID (the backing
+// slice repeats an account `weight` times). Caller must hold the pool lock.
+//
+//   - managed: weighted round-robin. currentIndex advances by one so successive
+//     calls rotate the starting point, preserving the existing fair-rotation
+//     behavior plus weight bias (heavier accounts occupy more slots).
+//   - health / aggressive: stable sort by modeRankLocked descending.
+func (p *AccountPool) candidateOrderLocked(mode string, allowOverUsage bool, now time.Time) []int {
+	n := len(p.accounts)
+	if n == 0 {
+		return nil
+	}
+
+	// Base order: weighted round-robin from the next rotating start point,
+	// de-duplicated by account ID (the backing slice repeats an account
+	// `weight` times). This rotation is the tie-breaker that keeps load
+	// spreading across equally-ranked accounts on successive calls — without
+	// it, a stable sort would always pick the same account when ranks tie
+	// (e.g. a cold pool where every account has zero usage / equal health).
+	start := int(atomic.AddUint64(&p.currentIndex, 1) % uint64(n))
+	order := make([]int, 0, n)
+	seen := make(map[string]bool, n)
+	for i := 0; i < n; i++ {
+		idx := (start + i) % n
+		id := p.accounts[idx].ID
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		order = append(order, idx)
+	}
+
+	if mode != "health" && mode != "aggressive" {
+		return order // managed: plain weighted round-robin
+	}
+
+	// health / aggressive: stable-sort the round-robin base by rank descending.
+	// Stability preserves the rotating order among equally-ranked accounts
+	// (load spreads), while higher-ranked accounts are tried first.
+	sort.SliceStable(order, func(a, b int) bool {
+		return p.modeRankLocked(&p.accounts[order[a]], mode, allowOverUsage, now) >
+			p.modeRankLocked(&p.accounts[order[b]], mode, allowOverUsage, now)
+	})
+	return order
+}
+
 func (p *AccountPool) getNextLockedExcept(model string, exclude map[string]bool) *config.Account {
 	if len(p.accounts) == 0 {
 		return nil
@@ -276,18 +397,11 @@ func (p *AccountPool) getNextLockedExcept(model string, exclude map[string]bool)
 
 	allowOverUsage := config.GetAllowOverUsage()
 	now := time.Now()
-	n := len(p.accounts)
-	seen := make(map[string]bool)
+	mode := config.GetBalanceMode()
 
-	// 加权轮询查找可用账号
-	for i := 0; i < n; i++ {
-		idx := atomic.AddUint64(&p.currentIndex, 1) % uint64(n)
+	// Try accounts in mode-preferred order (managed = weighted round-robin).
+	for _, idx := range p.candidateOrderLocked(mode, allowOverUsage, now) {
 		acc := &p.accounts[idx]
-
-		if seen[acc.ID] {
-			continue
-		}
-		seen[acc.ID] = true
 		if !p.canRouteAccountLocked(acc, model, exclude, allowOverUsage, now, true) {
 			continue
 		}
@@ -384,6 +498,11 @@ func (p *AccountPool) AcquireForModel(ctx context.Context, model string, exclude
 			return nil, nil, ErrRoutingUnavailable
 		}
 		atomic.AddUint64(&p.routeProcessedTotal, 1)
+		// Concurrency limiting is off, so there is no active/waiting gauge to
+		// snapshot (both 0); still record the processed event so windowed RPM,
+		// processed count and per-account distribution are populated when the
+		// bypass path is taken.
+		p.recordRouteSample(routeSample{kind: routeSampleProcessed, accountID: acc.ID})
 		return acc, func() {}, nil
 	}
 
@@ -419,18 +538,22 @@ func (p *AccountPool) AcquireForModel(ctx context.Context, model string, exclude
 		if !queued {
 			if rc.GlobalQueueSize <= 0 {
 				atomic.AddUint64(&p.routeRejectedTotal, 1)
+				p.recordRouteSample(routeSample{kind: routeSampleRejected})
 				return nil, nil, ErrRoutingQueueFull
 			}
 			p.mu.Lock()
 			if p.routeWaiting >= rc.GlobalQueueSize {
 				p.mu.Unlock()
 				atomic.AddUint64(&p.routeRejectedTotal, 1)
+				p.recordRouteSample(routeSample{kind: routeSampleRejected})
 				return nil, nil, ErrRoutingQueueFull
 			}
 			p.routeWaiting++
+			waitingSnapshot := p.routeWaiting
 			queued = true
 			p.mu.Unlock()
 			atomic.AddUint64(&p.routeEnqueuedTotal, 1)
+			p.recordRouteSample(routeSample{kind: routeSampleEnqueued, waiting: waitingSnapshot})
 		}
 
 		var intervalC <-chan time.Time
@@ -450,6 +573,7 @@ func (p *AccountPool) AcquireForModel(ctx context.Context, model string, exclude
 				timer.Stop()
 			}
 			atomic.AddUint64(&p.routeTimeoutTotal, 1)
+			p.recordRouteSample(routeSample{kind: routeSampleTimeout})
 			return nil, nil, ErrRoutingQueueTimeout
 		case <-res.notify:
 			if timer != nil {
@@ -621,6 +745,12 @@ func (p *AccountPool) tryAcquireForModel(model string, excluded map[string]bool,
 					if acc != nil {
 						atomic.AddUint64(&p.routeStickyHitTotal, 1)
 						atomic.AddUint64(&p.routeRequestTotal, 1)
+						p.appendRouteSampleLocked(routeSample{
+							kind:      routeSampleProcessed,
+							accountID: acc.ID,
+							stickyHit: true,
+							active:    p.routeGlobalActive,
+						})
 					}
 					return routingTryResult{account: copyAccount(acc), busy: acc == nil, wait: earliestWait, notify: p.routeNotify}, nil
 				}
@@ -636,26 +766,36 @@ func (p *AccountPool) tryAcquireForModel(model string, excluded map[string]bool,
 	// New conversation (no existing pin) may establish one; overflow from an
 	// existing pin must not, so it stays bound to the cache-warm account.
 	canPinHere := rc.StickyAccount && stickyID == ""
-	n := len(p.accounts)
-	seen := make(map[string]bool)
-	for i := 0; i < n; i++ {
-		idx := atomic.AddUint64(&p.currentIndex, 1) % uint64(n)
+	mode := config.GetBalanceMode()
+	// candidateOrderLocked is already de-duplicated by account ID, so the sticky
+	// target (already tried above) is the only index we still need to skip.
+	for _, idx := range p.candidateOrderLocked(mode, allowOverUsage, now) {
 		acc := &p.accounts[idx]
-		if seen[acc.ID] || (stickyID != "" && acc.ID == stickyID) {
+		if stickyID != "" && acc.ID == stickyID {
 			continue
 		}
-		seen[acc.ID] = true
 		if selected, _ := tryAccount(acc, canPinHere); selected != nil {
+			stickyMiss := false
+			stickyDivert := false
 			if strings.TrimSpace(affinityKey) != "" {
 				if stickyID != "" {
 					// Had a pin but it was busy/unhealthy → routed elsewhere this turn.
 					atomic.AddUint64(&p.routeStickyDivertTotal, 1)
+					stickyDivert = true
 				} else if rc.StickyAccount {
 					// New conversation established its pin here.
 					atomic.AddUint64(&p.routeStickyMissTotal, 1)
+					stickyMiss = true
 				}
 			}
 			atomic.AddUint64(&p.routeRequestTotal, 1)
+			p.appendRouteSampleLocked(routeSample{
+				kind:         routeSampleProcessed,
+				accountID:    selected.ID,
+				stickyMiss:   stickyMiss,
+				stickyDivert: stickyDivert,
+				active:       p.routeGlobalActive,
+			})
 			return routingTryResult{account: copyAccount(selected)}, nil
 		}
 	}
@@ -710,6 +850,10 @@ func (p *AccountPool) RoutingStats() map[string]interface{} {
 		"stickyMissTotal":   atomic.LoadUint64(&p.routeStickyMissTotal),
 		"stickyDivertTotal": atomic.LoadUint64(&p.routeStickyDivertTotal),
 		"requestTotal":      atomic.LoadUint64(&p.routeRequestTotal),
+		// True sliding-window RPM: count of routing events in the trailing 60s,
+		// computed server-side from per-request timestamps so it is stable
+		// regardless of the client's polling interval.
+		"requestsLastMinute": p.requestsInWindowLocked(time.Minute, time.Now()),
 	}
 }
 
@@ -732,6 +876,24 @@ func (p *AccountPool) getRecentStatsLocked(id string, now time.Time) (requests i
 		rate429 = float64(quotaErrors) / float64(requests)
 	}
 	return
+}
+
+// requestsInWindowLocked counts routing events across all accounts within the
+// trailing window ending at now. This is a true sliding-window measure: every
+// request carries its own timestamp, so the count does not depend on the
+// caller's polling cadence and does not flicker between polls.
+func (p *AccountPool) requestsInWindowLocked(window time.Duration, now time.Time) int {
+	cutoff := now.Add(-window)
+	count := 0
+	for _, events := range p.requestLog {
+		for i := len(events) - 1; i >= 0; i-- {
+			if events[i].at.Before(cutoff) {
+				break // events are append-ordered, so older ones precede
+			}
+			count++
+		}
+	}
+	return count
 }
 
 func (p *AccountPool) pruneRequestLogLocked(id string, now time.Time) {
@@ -791,6 +953,125 @@ func (p *AccountPool) appendRequestEventLocked(id string, is429 bool, isError bo
 	p.requestLog[id] = append(p.requestLog[id], requestEvent{at: now, is429: is429, isError: isError})
 	if isError {
 		p.lastErrorAt[id] = now
+	}
+}
+
+// recordRouteSample appends a routing-decision event, pruning entries older than
+// routeSampleWindow. Takes its own short-lived lock so callers (which run with
+// no lock held at the recording sites) stay simple; the slice is guarded by mu.
+func (p *AccountPool) recordRouteSample(s routeSample) {
+	if s.at.IsZero() {
+		s.at = time.Now()
+	}
+	p.mu.Lock()
+	p.appendRouteSampleLocked(s)
+	p.mu.Unlock()
+}
+
+// appendRouteSampleLocked appends a routing-decision event. Caller must hold mu.
+// Used directly from the acquire path, which already holds the lock when it
+// knows the sticky outcome and the post-increment gauge snapshot.
+func (p *AccountPool) appendRouteSampleLocked(s routeSample) {
+	if s.at.IsZero() {
+		s.at = time.Now()
+	}
+	p.pruneRouteSamplesLocked(s.at)
+	p.routeSamples = append(p.routeSamples, s)
+}
+
+// pruneRouteSamplesLocked drops samples older than routeSampleWindow relative to
+// now. Samples are append-ordered by time, so a single leading-trim suffices.
+func (p *AccountPool) pruneRouteSamplesLocked(now time.Time) {
+	if len(p.routeSamples) == 0 {
+		return
+	}
+	cutoff := now.Add(-routeSampleWindow)
+	idx := 0
+	for idx < len(p.routeSamples) && p.routeSamples[idx].at.Before(cutoff) {
+		idx++
+	}
+	if idx == 0 {
+		return
+	}
+	if idx >= len(p.routeSamples) {
+		p.routeSamples = p.routeSamples[:0]
+		return
+	}
+	p.routeSamples = append([]routeSample(nil), p.routeSamples[idx:]...)
+}
+
+// RoutingStatsWindow returns sliding-window routing metrics over the trailing
+// `window`, ending now. Counters (processed/enqueued/rejected/timeout, sticky
+// outcomes) count samples in the window. active/waiting are reported as the
+// window peak, falling back to the current instantaneous gauge so a long request
+// spanning the whole window (no rising-edge sample inside it) never shows 0
+// while traffic is live. perAccount is the per-account processed count in window.
+func (p *AccountPool) RoutingStatsWindow(window time.Duration, now time.Time) map[string]interface{} {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	cutoff := now.Add(-window)
+	var processed, enqueued, rejected, timeout uint64
+	var stickyHit, stickyMiss, stickyDivert uint64
+	var activePeak, waitingPeak int
+	perAccount := make(map[string]int)
+
+	for i := len(p.routeSamples) - 1; i >= 0; i-- {
+		s := p.routeSamples[i]
+		if s.at.Before(cutoff) {
+			break // append-ordered: everything earlier is also out of window
+		}
+		switch s.kind {
+		case routeSampleProcessed:
+			processed++
+			if s.accountID != "" {
+				perAccount[s.accountID]++
+			}
+			if s.active > activePeak {
+				activePeak = s.active
+			}
+			if s.stickyHit {
+				stickyHit++
+			}
+			if s.stickyMiss {
+				stickyMiss++
+			}
+			if s.stickyDivert {
+				stickyDivert++
+			}
+		case routeSampleEnqueued:
+			enqueued++
+			if s.waiting > waitingPeak {
+				waitingPeak = s.waiting
+			}
+		case routeSampleRejected:
+			rejected++
+		case routeSampleTimeout:
+			timeout++
+		}
+	}
+
+	// Peak falls back to the current instantaneous gauge (see doc comment).
+	if p.routeGlobalActive > activePeak {
+		activePeak = p.routeGlobalActive
+	}
+	if p.routeWaiting > waitingPeak {
+		waitingPeak = p.routeWaiting
+	}
+
+	return map[string]interface{}{
+		"active":             activePeak,
+		"waiting":            waitingPeak,
+		"perAccountActive":   perAccount,
+		"enqueuedTotal":      enqueued,
+		"processedTotal":     processed,
+		"rejectedTotal":      rejected,
+		"timeoutTotal":       timeout,
+		"stickyHitTotal":     stickyHit,
+		"stickyMissTotal":    stickyMiss,
+		"stickyDivertTotal":  stickyDivert,
+		"requestTotal":       processed,
+		"requestsLastMinute": p.requestsInWindowLocked(window, now),
 	}
 }
 

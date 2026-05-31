@@ -8,7 +8,13 @@ import (
 // metricsLiveCapacity is the number of most-recent request records retained in
 // memory for the live request stream. The buffer is a fixed-size ring; older
 // entries are overwritten. This is process-local and not persisted.
-const metricsLiveCapacity = 200
+//
+// Sized to cover the largest selectable live window (5min) at sustained high
+// throughput (~100 RPM ⇒ ~500 records) with headroom. Beyond this rate the
+// 5min request-stream view is truncated to the most recent 600 entries (a known
+// display limit); the windowed metric cards and per-account distribution are
+// derived from routeSamples, not this ring, so they remain accurate.
+const metricsLiveCapacity = 600
 
 // LiveRequestRecord is a single completed request, surfaced in the live
 // request stream of the concurrency dashboard.
@@ -117,4 +123,28 @@ func recordLiveRequest(rec LiveRequestRecord) {
 // recentLiveRequests returns the most-recent request records, newest first.
 func recentLiveRequests(limit int) []LiveRequestRecord {
 	return globalLiveRequests.recent(limit)
+}
+
+// recentLiveRequestsSince returns the most-recent records (newest first) whose
+// completion time is within the trailing window ending at now. The ring buffer
+// is bounded by metricsLiveCapacity, so at very high request rates a long
+// window may still be truncated to the most recent metricsLiveCapacity entries
+// — an accepted display limit for the request stream (windowed cards and
+// per-account distribution are driven by routeSamples, not this buffer).
+func recentLiveRequestsSince(limit int, windowSeconds int64, now int64) []LiveRequestRecord {
+	all := globalLiveRequests.recent(limit)
+	if windowSeconds <= 0 {
+		return all
+	}
+	cutoff := now - windowSeconds
+	out := make([]LiveRequestRecord, 0, len(all))
+	for _, rec := range all {
+		// recent() returns newest first, so once we cross the cutoff every
+		// remaining record is older and can be skipped.
+		if rec.Timestamp < cutoff {
+			break
+		}
+		out = append(out, rec)
+	}
+	return out
 }

@@ -40,6 +40,11 @@ var (
 const (
 	autoQuarantineSuspicious429Reason = "AUTO_QUARANTINE_SUSPICIOUS_429"
 	autoQuarantineDuration            = time.Hour
+	// operatorDisabledReason marks an account as explicitly disabled by an
+	// operator. It is intentionally distinct from the auto-429 quarantine reason
+	// so the auto-restore sweep (which only un-suspends AUTO_QUARANTINE_SUSPICIOUS_429
+	// accounts) never silently re-enables an account a human turned off.
+	operatorDisabledReason = "MANUALLY_DISABLED_BY_OPERATOR"
 )
 
 func defaultRoutingConcurrencyConfig() RoutingConcurrencyConfig {

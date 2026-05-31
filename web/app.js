@@ -40,8 +40,9 @@
   let customSelectRefreshQueued = false;
   let metricsRange = localStorage.getItem('metricsRange') || '24h';
   let lastMetrics = null;
-  let prevRequestTotal = 0; // for RPM calculation in live panel
   let liveTimer = null;
+  // Sliding-window span (seconds) for the live concurrency panel: 60 or 300.
+  let liveWindow = Number(localStorage.getItem('liveWindow')) === 300 ? 300 : 60;
   let currentSettingsTab = localStorage.getItem('settingsSubtab') || 'access';
 
   // DOM helpers
@@ -776,31 +777,148 @@
     if (ms >= 1000) return (ms / 1000).toFixed(ms >= 10000 ? 1 : 2) + 's';
     return Math.round(ms) + 'ms';
   }
+  // chartSpecs caches each chart's raw series + style by id so charts can be
+  // re-rendered on container resize (the SVG viewBox is sized to clientWidth,
+  // so a stale viewBox distorts the line after the window changes width).
+  const chartSpecs = {};
+  let chartResizeBound = false;
+
   function drawLineChart(id, series, color, suffix) {
+    chartSpecs[id] = { series, color, suffix };
+    renderLineChart(id);
+    if (!chartResizeBound) {
+      chartResizeBound = true;
+      let rt = null;
+      window.addEventListener('resize', () => {
+        clearTimeout(rt);
+        rt = setTimeout(() => Object.keys(chartSpecs).forEach(renderLineChart), 150);
+      });
+    }
+  }
+
+  // formatChartTime renders an axis/tooltip timestamp. Short ranges show HH:MM;
+  // 7d/30d ranges show MM-DD on the axis and MM-DD HH:MM in the tooltip.
+  function formatChartTime(ts, full) {
+    const d = new Date(Number(ts) * 1000);
+    const p2 = (n) => String(n).padStart(2, '0');
+    const longRange = metricsRange === '7d' || metricsRange === '30d';
+    const hm = p2(d.getHours()) + ':' + p2(d.getMinutes());
+    const md = (d.getMonth() + 1) + '-' + p2(d.getDate());
+    if (longRange) return full ? md + ' ' + hm : md;
+    return hm;
+  }
+
+  function renderLineChart(id) {
     const el = $(id);
     if (!el) return;
-    const points = (series && series.points || []).map(p => ({ t: Number(p.t || 0), v: Number(p.value || 0) }));
+    const spec = chartSpecs[id] || {};
+    const color = spec.color || '#60a5fa';
+    const suffix = spec.suffix;
+    const points = (spec.series && spec.series.points || []).map(p => ({ t: Number(p.t || 0), v: Number(p.value || 0) }));
     const w = Math.max(320, el.clientWidth || 640);
     const h = 190;
     const pad = { l: 44, r: 14, t: 16, b: 28 };
+
+    // Empty state: mirror renderTopList instead of drawing an empty grid.
+    if (!points.length) {
+      el.innerHTML = '<div class="chart-empty">' + escapeHtml(t('metrics.noData')) + '</div>';
+      el._chartGeom = null;
+      return;
+    }
+
     const maxV = Math.max(1, ...points.map(p => p.v));
-    const minT = points.length ? points[0].t : 0;
-    const maxT = points.length ? points[points.length - 1].t : minT + 1;
-    const x = (t) => pad.l + ((t - minT) / Math.max(1, maxT - minT)) * (w - pad.l - pad.r);
-    const y = (v) => h - pad.b - (v / maxV) * (h - pad.t - pad.b);
-    const path = points.map((p, i) => (i ? 'L' : 'M') + x(p.t).toFixed(1) + ' ' + y(p.v).toFixed(1)).join(' ');
-    const area = path ? path + ' L ' + x(maxT).toFixed(1) + ' ' + (h - pad.b) + ' L ' + x(minT).toFixed(1) + ' ' + (h - pad.b) + ' Z' : '';
+    const minT = points[0].t;
+    const maxT = points.length > 1 ? points[points.length - 1].t : minT + 1;
+    const xOf = (tt) => pad.l + ((tt - minT) / Math.max(1, maxT - minT)) * (w - pad.l - pad.r);
+    const yOf = (v) => h - pad.b - (v / maxV) * (h - pad.t - pad.b);
+
+    const path = points.map((p, i) => (i ? 'L' : 'M') + xOf(p.t).toFixed(1) + ' ' + yOf(p.v).toFixed(1)).join(' ');
+    const area = path + ' L ' + xOf(maxT).toFixed(1) + ' ' + (h - pad.b) + ' L ' + xOf(minT).toFixed(1) + ' ' + (h - pad.b) + ' Z';
+
     const grid = [0, 0.25, 0.5, 0.75, 1].map(r => {
       const gy = pad.t + r * (h - pad.t - pad.b);
       const label = compactMetric(maxV * (1 - r), suffix);
       return '<line x1="' + pad.l + '" y1="' + gy.toFixed(1) + '" x2="' + (w - pad.r) + '" y2="' + gy.toFixed(1) + '" class="chart-grid-line" />' +
         '<text x="' + (pad.l - 8) + '" y="' + (gy + 4).toFixed(1) + '" class="chart-axis-label" text-anchor="end">' + escapeHtml(label) + '</text>';
     }).join('');
+
+    // X-axis time ticks: up to 5 evenly spaced labels, edge-anchored so they
+    // never clip at the chart borders.
+    const tickCount = Math.min(points.length, 5);
+    let xticks = '';
+    for (let i = 0; i < tickCount; i++) {
+      const idx = tickCount > 1 ? Math.round(i / (tickCount - 1) * (points.length - 1)) : 0;
+      const p = points[idx];
+      const anchor = i === 0 ? 'start' : (i === tickCount - 1 ? 'end' : 'middle');
+      xticks += '<text x="' + xOf(p.t).toFixed(1) + '" y="' + (h - 8) + '" class="chart-axis-label" text-anchor="' + anchor + '">' + escapeHtml(formatChartTime(p.t)) + '</text>';
+    }
+
+    // A lone data point produces no visible stroke, so mark it with a dot.
+    const dot = points.length === 1
+      ? '<circle cx="' + xOf(points[0].t).toFixed(1) + '" cy="' + yOf(points[0].v).toFixed(1) + '" r="3.5" style="fill:' + color + '"></circle>'
+      : '';
+
     el.innerHTML = '<svg viewBox="0 0 ' + w + ' ' + h + '" role="img" aria-label="metric chart">' +
-      grid +
+      grid + xticks +
       '<path d="' + area + '" class="chart-area" style="fill:' + color + '"></path>' +
       '<path d="' + path + '" class="chart-line" style="stroke:' + color + '"></path>' +
-      '</svg>';
+      dot +
+      '<line class="chart-hover-line" y1="' + pad.t + '" y2="' + (h - pad.b) + '" style="display:none"></line>' +
+      '<circle class="chart-hover-dot" r="3.5" style="display:none;fill:' + color + '"></circle>' +
+      '</svg>' +
+      '<div class="chart-tooltip" style="display:none"></div>';
+
+    el._chartGeom = { points, xOf, yOf, w, suffix };
+    // Bind hover handlers on the container (not the SVG) once: innerHTML
+    // rewrites replace the SVG but leave the container's listeners intact.
+    if (!el._chartHoverBound) {
+      el._chartHoverBound = true;
+      el.addEventListener('mousemove', (e) => onChartHover(e, el));
+      el.addEventListener('mouseleave', () => hideChartHover(el));
+    }
+  }
+
+  function onChartHover(e, el) {
+    const g = el._chartGeom;
+    if (!g) return;
+    const svg = el.querySelector('svg');
+    if (!svg) return;
+    const rect = svg.getBoundingClientRect();
+    if (!rect.width) return;
+    // Map the mouse position from CSS pixels into viewBox coordinates.
+    const vx = (e.clientX - rect.left) * (g.w / rect.width);
+    let best = 0, bd = Infinity;
+    for (let i = 0; i < g.points.length; i++) {
+      const d = Math.abs(g.xOf(g.points[i].t) - vx);
+      if (d < bd) { bd = d; best = i; }
+    }
+    const p = g.points[best];
+    const px = g.xOf(p.t), py = g.yOf(p.v);
+    const line = svg.querySelector('.chart-hover-line');
+    const dotEl = svg.querySelector('.chart-hover-dot');
+    if (line) { line.setAttribute('x1', px.toFixed(1)); line.setAttribute('x2', px.toFixed(1)); line.style.display = ''; }
+    if (dotEl) { dotEl.setAttribute('cx', px.toFixed(1)); dotEl.setAttribute('cy', py.toFixed(1)); dotEl.style.display = ''; }
+    const tip = el.querySelector('.chart-tooltip');
+    if (tip) {
+      tip.innerHTML = '<span class="chart-tooltip-val">' + escapeHtml(compactMetric(p.v, g.suffix)) + '</span>' +
+        '<span class="chart-tooltip-time">' + escapeHtml(formatChartTime(p.t, true)) + '</span>';
+      tip.style.display = '';
+      const cssX = px * (rect.width / g.w);
+      const cw = el.clientWidth || rect.width;
+      tip.style.left = Math.max(48, Math.min(cw - 48, cssX)).toFixed(0) + 'px';
+    }
+  }
+
+  function hideChartHover(el) {
+    const svg = el.querySelector('svg');
+    if (svg) {
+      const line = svg.querySelector('.chart-hover-line');
+      const dotEl = svg.querySelector('.chart-hover-dot');
+      if (line) line.style.display = 'none';
+      if (dotEl) dotEl.style.display = 'none';
+    }
+    const tip = el.querySelector('.chart-tooltip');
+    if (tip) tip.style.display = 'none';
   }
   function compactMetric(v, suffix) {
     const n = Number(v || 0);
@@ -833,7 +951,7 @@
   // Live concurrency panel
   async function loadLive() {
     try {
-      const res = await api('/metrics/live?limit=50');
+      const res = await api('/metrics/live?limit=600&window=' + liveWindow);
       if (!res.ok) throw new Error('http ' + res.status);
       const data = await res.json();
       renderLive(data);
@@ -845,8 +963,17 @@
     const n = Number(v || 0);
     return n > 0 ? formatNum(n) : '∞';
   }
+  // renderLiveWindowToggle highlights the active sliding-window button so the
+  // selected span (1m / 5m) is visually clear.
+  function renderLiveWindowToggle() {
+    qsa('[data-live-window]').forEach(btn => {
+      const active = Number(btn.dataset.liveWindow) === liveWindow;
+      btn.classList.toggle('is-active', active);
+    });
+  }
   function renderLive(data) {
     if (!data) return;
+    renderLiveWindowToggle();
     const c = data.concurrency || {};
     setText('liveActive', formatNum(Number(c.active || 0)));
     setText('liveActiveLimit', liveLimitText(c.maxConcurrent));
@@ -856,10 +983,9 @@
     setText('liveProcessed', formatNum(Number(c.processedTotal || 0)));
     setText('liveRejected', formatNum(Number(c.rejectedTotal || 0)));
     setText('liveTimeout', formatNum(Number(c.timeoutTotal || 0)));
-    // RPM: delta since last poll, scaled to per-minute
-    const total = Number(c.requestTotal || 0);
-    const rpm = prevRequestTotal > 0 ? Math.round((total - prevRequestTotal) * 20) : 0;
-    prevRequestTotal = total;
+    // RPM: server-authoritative sliding window (count of routing events in the
+    // trailing 60s). Stable regardless of polling cadence, so it never flickers.
+    const rpm = Number(c.rpm || 0);
     setText('liveRpm', rpm > 0 ? formatNum(rpm) : '—');
     renderLiveSticky(data.sticky);
     renderLiveAccounts(data.perAccount, Number(c.maxConcurrent || 0));
@@ -898,19 +1024,20 @@
       return;
     }
     list.sort((a, b) => Number(b.active || 0) - Number(a.active || 0));
+    // Windowed semantics: `active` is the per-account request count within the
+    // selected window. Bars scale relative to the busiest account so the
+    // distribution shape is visible regardless of absolute traffic.
+    const maxCount = Math.max(1, ...list.map(it => Number(it.active || 0)));
     el.innerHTML = list.map(item => {
-      const active = Number(item.active || 0);
-      const limit = Number(item.limit || 0);
-      const label = item.email || item.accountId || t('metrics.unknown');
-      const denom = limit > 0 ? limit : Math.max(active, 1);
-      const pct = Math.max(6, Math.min(100, active / denom * 100));
-      const full = limit > 0 && active >= limit;
+      const count = Number(item.active || 0);
+      const label = maskEmail(item.email || '') || item.accountId || t('metrics.unknown');
+      const pct = Math.max(6, Math.min(100, count / maxCount * 100));
       return '<div class="live-acct-row">' +
         '<div class="live-acct-head">' +
         '<span class="live-acct-email" title="' + escapeAttr(label) + '">' + escapeHtml(label) + '</span>' +
-        '<span class="live-acct-count">' + active + ' / ' + (limit > 0 ? limit : '∞') + '</span>' +
+        '<span class="live-acct-count">' + formatNum(count) + '</span>' +
         '</div>' +
-        '<div class="live-acct-bar' + (full ? ' is-full' : '') + '"><span style="width:' + pct.toFixed(1) + '%"></span></div>' +
+        '<div class="live-acct-bar"><span style="width:' + pct.toFixed(1) + '%"></span></div>' +
         '</div>';
     }).join('');
   }
@@ -935,11 +1062,21 @@
       const tps = Number(item.tokensPerSec || 0);
       const totalTok = Number(item.totalTokens || 0);
       const nums = [];
+      // Keep each metric internally unbreakable (nbsp) so the nums column wraps
+      // only between metrics — a 3-digit-second latency then drops to a new line
+      // instead of overflowing and deforming the row.
       nums.push('<b>' + latency + '</b>');
-      if (ttft > 0) nums.push('TTFB ' + formatDurationMs(ttft));
-      if (tps > 0) nums.push(tps.toFixed(1) + ' tok/s');
-      nums.push(formatNum(totalTok) + ' tok');
+      if (ttft > 0) nums.push('TTFB&nbsp;' + formatDurationMs(ttft));
+      if (tps > 0) nums.push(tps.toFixed(1) + '&nbsp;tok/s');
+      nums.push(formatNum(totalTok) + '&nbsp;tok');
       let metaLeft = tags.join('');
+      // Show which account served this request, honoring privacy mode and
+      // truncating to avoid layout blowout.
+      const acctEmail = maskEmail(String(item.accountEmail || ''));
+      if (acctEmail) {
+        const shortEmail = acctEmail.length > 28 ? acctEmail.slice(0, 26) + '…' : acctEmail;
+        metaLeft += '<span class="live-tag live-tag-acct" title="' + escapeAttr(acctEmail) + '">' + escapeHtml(shortEmail) + '</span>';
+      }
       if (!ok) {
         const errLabel = item.errorType ? String(item.errorType) : ('HTTP ' + (item.statusCode || 0));
         metaLeft += '<span class="live-tag" style="color:var(--destructive)">' + escapeHtml(errLabel) + '</span>';
@@ -2447,6 +2584,27 @@
     return Number(n).toLocaleString('en-US', { maximumFractionDigits: 4 });
   }
 
+  // formatTokenCount abbreviates large token counts with K/M/B suffixes so the
+  // value fits a narrow column (e.g. 1234567 -> "1.23M"). Trailing zeros in the
+  // fraction are trimmed ("2.50M" -> "2.5M", "3.00B" -> "3B").
+  function formatTokenCount(n) {
+    n = Number(n);
+    if (n == null || isNaN(n)) return '0';
+    const abs = Math.abs(n);
+    const abbr = (v, suffix) => (v.toFixed(2).replace(/\.?0+$/, '')) + suffix;
+    if (abs >= 1e9) return abbr(n / 1e9, 'B');
+    if (abs >= 1e6) return abbr(n / 1e6, 'M');
+    if (abs >= 1e3) return abbr(n / 1e3, 'K');
+    return String(n);
+  }
+
+  // formatCredits always shows exactly two decimal places.
+  function formatCredits(n) {
+    n = Number(n);
+    if (n == null || isNaN(n)) return '0.00';
+    return n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  }
+
   function usageBar(used, limit) {
     if (!limit || limit <= 0) return '';
     const ratio = Math.max(0, Math.min(1, used / limit));
@@ -2528,8 +2686,8 @@
     return filtered.map(item => {
       const id = escapeAttr(item.id || '');
       const masked = escapeHtml(item.keyMasked || '');
-      const tokensLine = usageLine(t('apiKeys.tokens'), item.tokensUsed || 0, item.tokenLimit || 0);
-      const creditsLine = usageLine(t('apiKeys.credits'), item.creditsUsed || 0, item.creditLimit || 0);
+      const tokensLine = usageLine(t('apiKeys.tokens'), item.tokensUsed || 0, item.tokenLimit || 0, { fmt: formatTokenCount });
+      const creditsLine = usageLine(t('apiKeys.credits'), item.creditsUsed || 0, item.creditLimit || 0, { fmt: formatCredits });
       const requestsLine = '<div class="text-xs muted-text">' + escapeHtml(t('apiKeys.requests')) + ': ' + escapeHtml(formatNumber(item.requestsCount || 0)) + '</div>';
       return '<div class="card" data-apikey-id="' + id + '" style="margin-top:0.5rem;padding:0.75rem;">' +
         '<div class="flex items-center gap-2" style="flex-wrap:wrap;justify-content:space-between;">' +
@@ -2551,8 +2709,8 @@
       '</div>';
     }).join('');
   }
-  function apiKeyUsageCell(label, used, limit) {
-    const fmt = formatNumber;
+  function apiKeyUsageCell(label, used, limit, fmt) {
+    fmt = fmt || formatNumber;
     if (!limit || limit <= 0) {
       return '<strong>' + escapeHtml(fmt(used)) + '</strong><span class="apikey-list-sub">/ ' + escapeHtml(t('apiKeys.unlimited')) + '</span>';
     }
@@ -2569,8 +2727,8 @@
         '<div class="apikey-list-cell apikey-list-key"><span class="text-xs muted-text font-mono">' + masked + '</span></div>' +
         '<div class="apikey-list-cell apikey-list-status"><span class="list-cell-label">' + escapeHtml(t('apiKeys.colStatus')) + '</span>' + apiKeyToggle(id, item.enabled) + '<span class="text-xs ' + statusClass + '">' + escapeHtml(statusLabel) + '</span></div>' +
         '<div class="apikey-list-cell apikey-list-requests"><span class="list-cell-label">' + escapeHtml(t('apiKeys.requests')) + '</span><strong>' + escapeHtml(formatNumber(item.requestsCount || 0)) + '</strong></div>' +
-        '<div class="apikey-list-cell apikey-list-tokens"><span class="list-cell-label">' + escapeHtml(t('apiKeys.tokens')) + '</span>' + apiKeyUsageCell(t('apiKeys.tokens'), item.tokensUsed || 0, item.tokenLimit || 0) + '</div>' +
-        '<div class="apikey-list-cell apikey-list-credits"><span class="list-cell-label">' + escapeHtml(t('apiKeys.credits')) + '</span>' + apiKeyUsageCell(t('apiKeys.credits'), item.creditsUsed || 0, item.creditLimit || 0) + '</div>' +
+        '<div class="apikey-list-cell apikey-list-tokens"><span class="list-cell-label">' + escapeHtml(t('apiKeys.tokens')) + '</span>' + apiKeyUsageCell(t('apiKeys.tokens'), item.tokensUsed || 0, item.tokenLimit || 0, formatTokenCount) + '</div>' +
+        '<div class="apikey-list-cell apikey-list-credits"><span class="list-cell-label">' + escapeHtml(t('apiKeys.credits')) + '</span>' + apiKeyUsageCell(t('apiKeys.credits'), item.creditsUsed || 0, item.creditLimit || 0, formatCredits) + '</div>' +
         '<div class="apikey-list-cell apikey-list-actions">' + apiKeyActionButtons(id) + '</div>' +
         '</div>';
     }).join('');
@@ -3646,6 +3804,17 @@
       if (liveAuto.checked) startLivePolling();
       else stopLivePolling();
     });
+    qsa('[data-live-window]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const w = btn.dataset.liveWindow === '300' ? 300 : 60;
+        if (w === liveWindow) return;
+        liveWindow = w;
+        localStorage.setItem('liveWindow', String(liveWindow));
+        renderLiveWindowToggle();
+        loadLive();
+      });
+    });
+    renderLiveWindowToggle();
 
     qsa('[data-copy]').forEach(btn => btn.addEventListener('click', async () => {
       const id = btn.dataset.copy;
@@ -3665,6 +3834,9 @@
       privacyModeEnabled = e.target.checked;
       localStorage.setItem('privacyMode', privacyModeEnabled);
       renderAccounts();
+      // Live panel also renders account emails, so refresh it to honor the new
+      // privacy setting immediately instead of waiting for the next poll.
+      loadLive();
     });
 
     $('exportBtn').addEventListener('click', showExportModal);

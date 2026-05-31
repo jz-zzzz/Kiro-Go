@@ -705,3 +705,238 @@ func TestStickyOutcomeCounters(t *testing.T) {
 		t.Fatalf("stickyDivertTotal = %d, want 0", got)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// BalanceMode routing (health / managed / aggressive)
+// ---------------------------------------------------------------------------
+
+// TestBalanceModeAggressivePrefersMostUtilizedWithHeadroom verifies aggressive
+// mode concentrates load on the fullest account that still has headroom.
+func TestBalanceModeAggressivePrefersMostUtilizedWithHeadroom(t *testing.T) {
+	initPoolTestConfig(t)
+	if err := config.UpdateBalanceMode("aggressive"); err != nil {
+		t.Fatalf("set balance mode: %v", err)
+	}
+	p := newTestPool(
+		config.Account{ID: "low", UsageCurrent: 200, UsageLimit: 1000},  // frac 0.2
+		config.Account{ID: "mid", UsageCurrent: 600, UsageLimit: 1000},  // frac 0.6
+		config.Account{ID: "high", UsageCurrent: 900, UsageLimit: 1000}, // frac 0.9
+	)
+	if acc := p.GetNextForModel("model"); acc == nil || acc.ID != "high" {
+		t.Fatalf("aggressive should pick most-utilized account with headroom (high), got %#v", acc)
+	}
+}
+
+// TestBalanceModeAggressiveUsesTotalBudgetWithOverage proves fullness is
+// measured against the total budget (subscription + overage cap) — not the
+// subscription quota — when overage is in effect. Account "overSub" has blown
+// past its subscription limit but sits at only ~10% of its total budget, so it
+// must rank *below* "withinSub" which is at 25% of its subscription quota.
+func TestBalanceModeAggressiveUsesTotalBudgetWithOverage(t *testing.T) {
+	initPoolTestConfig(t)
+	if err := config.UpdateBalanceMode("aggressive"); err != nil {
+		t.Fatalf("set balance mode: %v", err)
+	}
+	if err := config.UpdateAllowOverUsage(true); err != nil {
+		t.Fatalf("allow over usage: %v", err)
+	}
+	p := newTestPool(
+		// 1137/1000 subscription (113%) but 1137/(1000+10000)=10.3% of total budget.
+		config.Account{ID: "overSub", UsageCurrent: 1137, UsageLimit: 1000, OverageStatus: "ENABLED", OverageCap: 10000},
+		// 500/2000 subscription = 25%, no overage.
+		config.Account{ID: "withinSub", UsageCurrent: 500, UsageLimit: 2000},
+	)
+	if acc := p.GetNextForModel("model"); acc == nil || acc.ID != "withinSub" {
+		t.Fatalf("aggressive should rank by total-budget fraction (withinSub 25%% > overSub 10%%), got %#v", acc)
+	}
+}
+
+// TestBalanceModeAggressiveSkipsFullAccount verifies a genuinely full account
+// (fraction >= 1) ranks below any account that still has headroom.
+func TestBalanceModeAggressiveSkipsFullAccount(t *testing.T) {
+	initPoolTestConfig(t)
+	if err := config.UpdateBalanceMode("aggressive"); err != nil {
+		t.Fatalf("set balance mode: %v", err)
+	}
+	p := newTestPool(
+		// Full: at subscription limit with overage enabled (routable, but full).
+		config.Account{ID: "full", UsageCurrent: 1000, UsageLimit: 1000, OverageStatus: "ENABLED"},
+		config.Account{ID: "headroom", UsageCurrent: 500, UsageLimit: 1000},
+	)
+	if acc := p.GetNextForModel("model"); acc == nil || acc.ID != "headroom" {
+		t.Fatalf("aggressive should prefer account with headroom over a full one, got %#v", acc)
+	}
+}
+
+// TestBalanceModeHealthPrefersHealthiest verifies health mode spreads load to
+// the healthiest/emptiest account (lower usage → higher health score).
+func TestBalanceModeHealthPrefersHealthiest(t *testing.T) {
+	initPoolTestConfig(t)
+	if err := config.UpdateBalanceMode("health"); err != nil {
+		t.Fatalf("set balance mode: %v", err)
+	}
+	p := newTestPool(
+		config.Account{ID: "healthy", UsageCurrent: 100, UsageLimit: 1000, UsagePercent: 0.1},
+		config.Account{ID: "loaded", UsageCurrent: 900, UsageLimit: 1000, UsagePercent: 0.9},
+	)
+	if acc := p.GetNextForModel("model"); acc == nil || acc.ID != "healthy" {
+		t.Fatalf("health should pick the healthiest (lowest usage) account, got %#v", acc)
+	}
+}
+
+// TestBalanceModeManagedRoundRobin verifies managed mode keeps plain weighted
+// round-robin: successive picks rotate through every account.
+func TestBalanceModeManagedRoundRobin(t *testing.T) {
+	initPoolTestConfig(t)
+	if err := config.UpdateBalanceMode("managed"); err != nil {
+		t.Fatalf("set balance mode: %v", err)
+	}
+	p := newTestPool(
+		config.Account{ID: "a"},
+		config.Account{ID: "b"},
+		config.Account{ID: "c"},
+	)
+	seen := make(map[string]bool)
+	for i := 0; i < 3; i++ {
+		acc := p.GetNextForModel("model")
+		if acc == nil {
+			t.Fatalf("managed round-robin returned nil on pick %d", i)
+		}
+		seen[acc.ID] = true
+	}
+	for _, id := range []string{"a", "b", "c"} {
+		if !seen[id] {
+			t.Fatalf("managed round-robin did not cover account %q over 3 picks (seen=%v)", id, seen)
+		}
+	}
+}
+
+// --- Sliding-window routing metrics (RoutingStatsWindow) ---
+
+// TestRoutingStatsWindowCountsOnlyInWindow verifies samples outside the trailing
+// window are excluded while in-window samples are aggregated by kind.
+func TestRoutingStatsWindowCountsOnlyInWindow(t *testing.T) {
+	p := newTestPool()
+	now := time.Now()
+	p.routeSamples = []routeSample{
+		{at: now.Add(-90 * time.Second), kind: routeSampleProcessed, accountID: "a"}, // out of 60s window
+		{at: now.Add(-30 * time.Second), kind: routeSampleProcessed, accountID: "a"},
+		{at: now.Add(-10 * time.Second), kind: routeSampleProcessed, accountID: "b"},
+		{at: now.Add(-5 * time.Second), kind: routeSampleEnqueued, waiting: 2},
+		{at: now.Add(-3 * time.Second), kind: routeSampleRejected},
+		{at: now.Add(-1 * time.Second), kind: routeSampleTimeout},
+	}
+	stats := p.RoutingStatsWindow(time.Minute, now)
+	if got := stats["processedTotal"].(uint64); got != 2 {
+		t.Fatalf("processedTotal = %d, want 2 (the -90s sample is out of window)", got)
+	}
+	if got := stats["enqueuedTotal"].(uint64); got != 1 {
+		t.Fatalf("enqueuedTotal = %d, want 1", got)
+	}
+	if got := stats["rejectedTotal"].(uint64); got != 1 {
+		t.Fatalf("rejectedTotal = %d, want 1", got)
+	}
+	if got := stats["timeoutTotal"].(uint64); got != 1 {
+		t.Fatalf("timeoutTotal = %d, want 1", got)
+	}
+	per := stats["perAccountActive"].(map[string]int)
+	if per["a"] != 1 || per["b"] != 1 {
+		t.Fatalf("perAccountActive = %v, want a:1 b:1 (a's -90s sample excluded)", per)
+	}
+}
+
+// TestRoutingStatsWindow5MinIncludesMore verifies the larger window admits
+// samples the 1-minute window excludes.
+func TestRoutingStatsWindow5MinIncludesMore(t *testing.T) {
+	p := newTestPool()
+	now := time.Now()
+	p.routeSamples = []routeSample{
+		{at: now.Add(-90 * time.Second), kind: routeSampleProcessed, accountID: "a"},
+		{at: now.Add(-30 * time.Second), kind: routeSampleProcessed, accountID: "a"},
+	}
+	if got := p.RoutingStatsWindow(time.Minute, now)["processedTotal"].(uint64); got != 1 {
+		t.Fatalf("1m processedTotal = %d, want 1", got)
+	}
+	if got := p.RoutingStatsWindow(5*time.Minute, now)["processedTotal"].(uint64); got != 2 {
+		t.Fatalf("5m processedTotal = %d, want 2", got)
+	}
+}
+
+// TestRoutingStatsWindowActivePeak verifies active/waiting report the in-window
+// peak from sample snapshots.
+func TestRoutingStatsWindowActivePeak(t *testing.T) {
+	p := newTestPool()
+	now := time.Now()
+	p.routeSamples = []routeSample{
+		{at: now.Add(-40 * time.Second), kind: routeSampleProcessed, accountID: "a", active: 2},
+		{at: now.Add(-20 * time.Second), kind: routeSampleProcessed, accountID: "b", active: 5}, // peak
+		{at: now.Add(-10 * time.Second), kind: routeSampleProcessed, accountID: "c", active: 3},
+		{at: now.Add(-15 * time.Second), kind: routeSampleEnqueued, waiting: 4},
+	}
+	stats := p.RoutingStatsWindow(time.Minute, now)
+	if got := stats["active"].(int); got != 5 {
+		t.Fatalf("active peak = %d, want 5", got)
+	}
+	if got := stats["waiting"].(int); got != 4 {
+		t.Fatalf("waiting peak = %d, want 4", got)
+	}
+}
+
+// TestRoutingStatsWindowPeakFallsBackToCurrent verifies that when no rising-edge
+// sample exists in the window (e.g. a long request spanning the whole window),
+// the peak falls back to the current instantaneous gauge rather than showing 0.
+func TestRoutingStatsWindowPeakFallsBackToCurrent(t *testing.T) {
+	p := newTestPool()
+	now := time.Now()
+	// No in-window samples at all, but a request is currently active.
+	p.routeGlobalActive = 3
+	p.routeWaiting = 1
+	stats := p.RoutingStatsWindow(time.Minute, now)
+	if got := stats["active"].(int); got != 3 {
+		t.Fatalf("active = %d, want 3 (fallback to current gauge)", got)
+	}
+	if got := stats["waiting"].(int); got != 1 {
+		t.Fatalf("waiting = %d, want 1 (fallback to current gauge)", got)
+	}
+}
+
+// TestRoutingStatsWindowStickyClassification verifies sticky hit/miss/divert are
+// counted from processed-sample flags.
+func TestRoutingStatsWindowStickyClassification(t *testing.T) {
+	p := newTestPool()
+	now := time.Now()
+	p.routeSamples = []routeSample{
+		{at: now.Add(-30 * time.Second), kind: routeSampleProcessed, accountID: "a", stickyHit: true},
+		{at: now.Add(-20 * time.Second), kind: routeSampleProcessed, accountID: "b", stickyMiss: true},
+		{at: now.Add(-10 * time.Second), kind: routeSampleProcessed, accountID: "c", stickyDivert: true},
+		{at: now.Add(-5 * time.Second), kind: routeSampleProcessed, accountID: "a", stickyHit: true},
+	}
+	stats := p.RoutingStatsWindow(time.Minute, now)
+	if got := stats["stickyHitTotal"].(uint64); got != 2 {
+		t.Fatalf("stickyHitTotal = %d, want 2", got)
+	}
+	if got := stats["stickyMissTotal"].(uint64); got != 1 {
+		t.Fatalf("stickyMissTotal = %d, want 1", got)
+	}
+	if got := stats["stickyDivertTotal"].(uint64); got != 1 {
+		t.Fatalf("stickyDivertTotal = %d, want 1", got)
+	}
+}
+
+// TestPruneRouteSamplesDropsOld verifies the rolling log trims entries older than
+// routeSampleWindow on append.
+func TestPruneRouteSamplesDropsOld(t *testing.T) {
+	p := newTestPool()
+	now := time.Now()
+	p.routeSamples = []routeSample{
+		{at: now.Add(-routeSampleWindow - time.Minute), kind: routeSampleProcessed, accountID: "old"},
+		{at: now.Add(-routeSampleWindow - time.Second), kind: routeSampleProcessed, accountID: "old2"},
+	}
+	p.appendRouteSampleLocked(routeSample{at: now, kind: routeSampleProcessed, accountID: "new"})
+	if len(p.routeSamples) != 1 {
+		t.Fatalf("after prune len = %d, want 1 (only the new sample)", len(p.routeSamples))
+	}
+	if p.routeSamples[0].accountID != "new" {
+		t.Fatalf("remaining sample = %q, want \"new\"", p.routeSamples[0].accountID)
+	}
+}

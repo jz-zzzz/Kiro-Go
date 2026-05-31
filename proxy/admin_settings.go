@@ -203,10 +203,20 @@ func (h *Handler) apiMetricsLive(w http.ResponseWriter, r *http.Request) {
 		limit = 50
 	}
 
-	rc := config.GetRoutingConcurrencyConfig()
-	stats := h.pool.RoutingStats()
+	// window selects the sliding-window span for all live metrics. Only 60s and
+	// 300s are offered by the UI; anything else falls back to 60s.
+	windowSec, _ := strconv.Atoi(r.URL.Query().Get("window"))
+	if windowSec != 300 {
+		windowSec = 60
+	}
+	window := time.Duration(windowSec) * time.Second
+	now := time.Now()
 
-	// Per-account concurrency: enrich {accountId: active} with email + limit.
+	rc := config.GetRoutingConcurrencyConfig()
+	stats := h.pool.RoutingStatsWindow(window, now)
+
+	// Per-account distribution: windowed request count per account, enriched
+	// with email + per-account concurrency limit.
 	perAccount := make([]map[string]interface{}, 0)
 	if raw, ok := stats["perAccountActive"].(map[string]int); ok {
 		for id, active := range raw {
@@ -233,6 +243,8 @@ func (h *Handler) apiMetricsLive(w http.ResponseWriter, r *http.Request) {
 		"rejectedTotal":  stats["rejectedTotal"],
 		"timeoutTotal":   stats["timeoutTotal"],
 		"requestTotal":   stats["requestTotal"],
+		"rpm":            stats["requestsLastMinute"],
+		"window":         windowSec,
 	}
 
 	// Sticky (conversation affinity) outcomes. hitRate is over affinity-keyed
@@ -259,7 +271,7 @@ func (h *Handler) apiMetricsLive(w http.ResponseWriter, r *http.Request) {
 		"concurrency": concurrency,
 		"sticky":      sticky,
 		"perAccount":  perAccount,
-		"recent":      recentLiveRequests(limit),
+		"recent":      recentLiveRequestsSince(limit, int64(windowSec), now.Unix()),
 	})
 }
 

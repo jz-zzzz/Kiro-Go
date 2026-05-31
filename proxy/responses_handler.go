@@ -239,7 +239,8 @@ func (h *Handler) handleResponsesNonStream(
 	h.recordFailure()
 	statusCode, errType := metricsErrorDetails(lastErr, http.StatusInternalServerError, "server_error")
 	recordRequestMetrics("responses", model, false, lastAccount, apiKeyID, false, statusCode, errType, estimatedInputTokens, 0, 0, requestStartedAt)
-	h.sendOpenAIError(w, 500, "server_error", lastErr.Error())
+	logRetryExhausted("responses", model, statusCode, errType, lastErr)
+	h.sendOpenAIError(w, statusCode, clientFacingOpenAIErrorType(statusCode), lastErr.Error())
 }
 
 func buildResponsesObject(
@@ -646,13 +647,14 @@ func (h *Handler) handleResponsesStream(
 	h.recordFailure()
 	statusCode, errType := metricsErrorDetails(lastErr, http.StatusInternalServerError, "server_error")
 	recordRequestMetrics("responses", model, true, lastAccount, apiKeyID, false, statusCode, errType, estimatedInputTokens, 0, 0, requestStartedAt)
+	logRetryExhausted("responses", model, statusCode, errType, lastErr)
 	send("response.failed", map[string]interface{}{
 		"type": "response.failed",
 		"response": map[string]interface{}{
 			"id":     respID,
 			"status": "failed",
 			"error": map[string]string{
-				"type":    "server_error",
+				"type":    clientFacingOpenAIErrorType(statusCode),
 				"message": lastErr.Error(),
 			},
 		},

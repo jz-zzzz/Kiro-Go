@@ -220,7 +220,7 @@ type AccountInfo struct {
 }
 
 // Version current version
-const Version = "1.1.1"
+const Version = "1.1.2"
 
 // PromptFilterConfig holds all prompt filter settings for API responses.
 type PromptFilterConfig struct {

@@ -6,6 +6,13 @@ func AutoQuarantineSuspicious429Reason() string {
 	return autoQuarantineSuspicious429Reason
 }
 
+// OperatorDisabledReason is the BanReason stamped when a human operator disables
+// an account. It marks the account as DISABLED (not SUSPENDED), which keeps the
+// auto-restore sweep from ever re-enabling it.
+func OperatorDisabledReason() string {
+	return operatorDisabledReason
+}
+
 func shouldAutoRestoreSuspendedAccount(a Account, now time.Time) bool {
 	return a.BanStatus == "SUSPENDED" && a.BanReason == autoQuarantineSuspicious429Reason && a.BanTime > 0 && now.Unix()-a.BanTime >= int64(autoQuarantineDuration/time.Second)
 }

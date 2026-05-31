@@ -1,6 +1,9 @@
 package proxy
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func TestComputeTokensPerSec(t *testing.T) {
 	cases := []struct {
@@ -110,5 +113,37 @@ func TestRecordLiveRequestDerivedFields(t *testing.T) {
 	}
 	if got[0].TokensPerSec != 10 {
 		t.Fatalf("expected 10 tok/s, got %v", got[0].TokensPerSec)
+	}
+}
+
+// TestRecentLiveRequestsSinceFiltersByWindow verifies records older than the
+// trailing window are dropped and the within-window ones are kept (newest first).
+func TestRecentLiveRequestsSinceFiltersByWindow(t *testing.T) {
+	// Reset global store so this test is deterministic regardless of order.
+	globalLiveRequests = &liveRequestStore{buf: make([]LiveRequestRecord, metricsLiveCapacity)}
+	now := time.Now().Unix()
+	// Insert in real arrival order (oldest first) so the ring's write order
+	// matches time order; recentLiveRequestsSince relies on that for its
+	// newest-first break optimization, just as live traffic does.
+	recordLiveRequest(LiveRequestRecord{Timestamp: now - 400, Model: "old"})
+	recordLiveRequest(LiveRequestRecord{Timestamp: now - 120, Model: "mid"})
+	recordLiveRequest(LiveRequestRecord{Timestamp: now - 10, Model: "fresh"})
+
+	// 60s window: only "fresh".
+	got := recentLiveRequestsSince(600, 60, now)
+	if len(got) != 1 || got[0].Model != "fresh" {
+		t.Fatalf("60s window: expected [fresh], got %+v", got)
+	}
+
+	// 300s window: "fresh" and "mid" (newest first), not "old".
+	got = recentLiveRequestsSince(600, 300, now)
+	if len(got) != 2 || got[0].Model != "fresh" || got[1].Model != "mid" {
+		t.Fatalf("300s window: expected [fresh mid], got %+v", got)
+	}
+
+	// window<=0 disables filtering: all three.
+	got = recentLiveRequestsSince(600, 0, now)
+	if len(got) != 3 {
+		t.Fatalf("no-window: expected 3 records, got %d", len(got))
 	}
 }

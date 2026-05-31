@@ -44,6 +44,54 @@ type OpenAITool struct {
 	} `json:"function"`
 }
 
+// UnmarshalJSON accepts both the Chat Completions tool shape, where the tool
+// definition is nested under "function":
+//
+//	{"type":"function","function":{"name":"x","description":"...","parameters":{...}}}
+//
+// and the Responses API tool shape, where name/description/parameters live at
+// the top level:
+//
+//	{"type":"function","name":"x","description":"...","parameters":{...}}
+//
+// Without this, Responses API tools would parse with an empty Function.Name,
+// which Kiro rejects with HTTP 400 "Improperly formed request".
+func (t *OpenAITool) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		Type        string      `json:"type"`
+		Name        string      `json:"name"`
+		Description string      `json:"description"`
+		Parameters  interface{} `json:"parameters"`
+		Function    *struct {
+			Name        string      `json:"name"`
+			Description string      `json:"description"`
+			Parameters  interface{} `json:"parameters"`
+		} `json:"function"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+
+	t.Type = raw.Type
+	if raw.Function != nil {
+		t.Function.Name = raw.Function.Name
+		t.Function.Description = raw.Function.Description
+		t.Function.Parameters = raw.Function.Parameters
+	}
+	// Fall back to top-level (Responses API) fields when the nested form is
+	// absent or incomplete.
+	if t.Function.Name == "" {
+		t.Function.Name = raw.Name
+	}
+	if t.Function.Description == "" {
+		t.Function.Description = raw.Description
+	}
+	if t.Function.Parameters == nil {
+		t.Function.Parameters = raw.Parameters
+	}
+	return nil
+}
+
 type OpenAIResponse struct {
 	ID      string         `json:"id"`
 	Object  string         `json:"object"`
@@ -146,7 +194,17 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 			})
 
 		case "tool":
-			content := extractOpenAIMessageText(msg.Content)
+			cleanText, toolImages := extractOpenAIUserContent(msg.Content)
+			var content string
+			if len(toolImages) > 0 {
+				currentImages = append(currentImages, toolImages...)
+				content = strings.TrimSpace(cleanText)
+				if content == "" {
+					content = toolResultImagePlaceholder
+				}
+			} else {
+				content = extractOpenAIMessageText(msg.Content)
+			}
 			currentToolResults = append(currentToolResults, KiroToolResult{
 				ToolUseID: msg.ToolCallID,
 				Content:   []KiroResultContent{{Text: content}},
@@ -157,17 +215,22 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 			nextIdx := i + 1
 			if nextIdx >= len(nonSystemMessages) || nonSystemMessages[nextIdx].Role != "tool" {
 				if !isLast {
+					// Store the tool results structurally only; sanitizeKiroHistory
+					// narrates them into text exactly once. Pre-filling Content with
+					// buildToolResultsContinuation here would duplicate the output
+					// (continuation text + narrated text).
 					history = append(history, KiroHistoryMessage{
 						UserInputMessage: &KiroUserInputMessage{
-							Content: buildToolResultsContinuation(currentToolResults),
 							ModelID: modelID,
 							Origin:  origin,
+							Images:  currentImages,
 							UserInputMessageContext: &UserInputMessageContext{
 								ToolResults: currentToolResults,
 							},
 						},
 					})
 					currentToolResults = nil
+					currentImages = nil
 				}
 			}
 		}
@@ -190,6 +253,21 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 			},
 		}
 		history = append(priming, history...)
+	}
+
+	// Decide whether the current tool results form a valid "active" tool turn:
+	// the last history assistant must carry matching structured toolUses. If not
+	// (orphaned tool results, e.g. after context compaction), flatten them into
+	// the current message text so the upstream does not reject the request.
+	currentToolResultIDs := collectToolResultIDs(currentToolResults)
+	keepCurrentToolResults := currentToolResultsMatchLastAssistant(history, currentToolResultIDs)
+
+	// Flatten structured tool calls/results that live in history; upstream only
+	// accepts a single active tool turn (last assistant toolUses ⟺ current toolResults).
+	if keepCurrentToolResults {
+		history = sanitizeKiroHistory(history, currentToolResultIDs)
+	} else {
+		history = sanitizeKiroHistory(history, nil)
 	}
 
 	// 构建最终内容
@@ -227,9 +305,17 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 	}
 
 	if len(kiroTools) > 0 || len(currentToolResults) > 0 {
-		payload.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext = &UserInputMessageContext{
-			Tools:       kiroTools,
-			ToolResults: currentToolResults,
+		// Only attach structured tool results when they answer the last history
+		// assistant turn; otherwise they have already been folded into finalContent.
+		var attachToolResults []KiroToolResult
+		if keepCurrentToolResults {
+			attachToolResults = currentToolResults
+		}
+		if len(kiroTools) > 0 || len(attachToolResults) > 0 {
+			payload.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext = &UserInputMessageContext{
+				Tools:       kiroTools,
+				ToolResults: attachToolResults,
+			}
 		}
 	}
 
@@ -244,6 +330,8 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 			TopP:        req.TopP,
 		}
 	}
+
+	truncatePayloadToLimit(payload, systemPrompt != "")
 
 	return payload
 }

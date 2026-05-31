@@ -37,6 +37,7 @@ const ThinkingModePrompt = `<thinking_mode>enabled</thinking_mode>
 
 const minimalFallbackUserContent = "."
 const toolResultsContinuationPrefix = "Tool results:"
+const toolResultImagePlaceholder = "[Tool returned an image; the image is attached to this message.]"
 
 // ParseModelAndThinking resolves a client-supplied model name to a Kiro model ID
 // and reports whether thinking mode was requested via the configured suffix.

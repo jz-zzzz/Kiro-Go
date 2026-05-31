@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"kiro-go/logger"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -176,14 +177,46 @@ func updateTokensFromEvent(event map[string]interface{}, currentInputTokens, cur
 }
 
 // getContextWindowSize returns the context window size (in tokens) for a model.
+// Claude 4.6 and newer (sonnet-4.6, opus-4.6, opus-4.7, opus-4.8, and future
+// 4.x releases) use a 1M window, while 4.5 and earlier (opus-4.5, sonnet-4.5,
+// sonnet-4, haiku-4.5) use 200K. This converts the upstream
+// contextUsagePercentage into an absolute input-token count that clients rely
+// on to decide when to compact; an undersized window under-reports tokens and
+// prevents clients from compacting in time.
 func getContextWindowSize(model string) int {
-	m := strings.ToLower(model)
-	// sonnet-4.6, opus-4.6, opus-4.7 all have 1M context windows
-	if strings.Contains(m, "4.6") || strings.Contains(m, "4-6") ||
-		strings.Contains(m, "4.7") || strings.Contains(m, "4-7") {
+	if isLargeContextModel(model) {
 		return 1_000_000
 	}
 	return 200_000
+}
+
+// claudeVersionExtractor matches "claude-<family>-<major>.<minor>" (dot or dash
+// form) and is used to classify 1M-window models by version.
+var claudeVersionExtractor = regexp.MustCompile(`claude-(?:opus|sonnet|haiku)-(\d+)[.-](\d+)`)
+
+func isLargeContextModel(model string) bool {
+	m := strings.ToLower(model)
+	if match := claudeVersionExtractor.FindStringSubmatch(m); match != nil {
+		major, errMaj := strconv.Atoi(match[1])
+		minor, errMin := strconv.Atoi(match[2])
+		if errMaj == nil && errMin == nil {
+			// 1M window for Claude >= 4.6 (4.6, 4.7, 4.8, ...) and any major >= 5.
+			if major > 4 {
+				return true
+			}
+			if major == 4 && minor >= 6 {
+				return true
+			}
+			return false
+		}
+	}
+	// Fallback substring checks for non-standard identifiers.
+	for _, tag := range []string{"4.6", "4-6", "4.7", "4-7", "4.8", "4-8", "4.9", "4-9"} {
+		if strings.Contains(m, tag) {
+			return true
+		}
+	}
+	return false
 }
 
 func collectUsageMaps(v interface{}, out *[]map[string]interface{}) {

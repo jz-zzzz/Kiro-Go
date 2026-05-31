@@ -530,6 +530,12 @@ func convertOpenAITools(tools []OpenAITool) []KiroToolWrapper {
 		if tool.Type != "function" {
 			continue
 		}
+		// Skip tool specs with no name. A nameless tool reaching the upstream
+		// triggers HTTP 400 "Improperly formed request"; this can happen if a
+		// client sends an unrecognized tool shape that parses to an empty name.
+		if strings.TrimSpace(tool.Function.Name) == "" {
+			continue
+		}
 		desc := tool.Function.Description
 		if len([]rune(desc)) > maxToolDescLen {
 			desc = truncateRunes(desc, maxToolDescLen) + "..."

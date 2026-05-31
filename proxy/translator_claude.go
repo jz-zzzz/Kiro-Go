@@ -153,6 +153,21 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 		history = append(priming, history...)
 	}
 
+	// Decide whether the current tool results form a valid "active" tool turn:
+	// the last history assistant must carry matching structured toolUses. If not
+	// (orphaned tool results, e.g. after context compaction), flatten them into
+	// the current message text so the upstream does not reject the request.
+	currentToolResultIDs := collectToolResultIDs(currentToolResults)
+	keepCurrentToolResults := currentToolResultsMatchLastAssistant(history, currentToolResultIDs)
+
+	// Flatten structured tool calls/results that live in history; upstream only
+	// accepts a single active tool turn (last assistant toolUses ⟺ current toolResults).
+	if keepCurrentToolResults {
+		history = sanitizeKiroHistory(history, currentToolResultIDs)
+	} else {
+		history = sanitizeKiroHistory(history, nil)
+	}
+
 	// 构建最终内容
 	finalContent := ""
 	if currentContent != "" {
@@ -191,9 +206,17 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	}
 
 	if len(kiroTools) > 0 || len(currentToolResults) > 0 {
-		payload.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext = &UserInputMessageContext{
-			Tools:       kiroTools,
-			ToolResults: currentToolResults,
+		// Only attach structured tool results when they answer the last history
+		// assistant turn; otherwise they have already been folded into finalContent.
+		var attachToolResults []KiroToolResult
+		if keepCurrentToolResults {
+			attachToolResults = currentToolResults
+		}
+		if len(kiroTools) > 0 || len(attachToolResults) > 0 {
+			payload.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext = &UserInputMessageContext{
+				Tools:       kiroTools,
+				ToolResults: attachToolResults,
+			}
 		}
 	}
 
@@ -208,6 +231,8 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 			TopP:        req.TopP,
 		}
 	}
+
+	truncatePayloadToLimit(payload, systemPrompt != "")
 
 	return payload
 }
@@ -344,7 +369,13 @@ func extractClaudeUserContent(content interface{}) (string, []KiroImage, []KiroT
 				}
 			case "tool_result":
 				toolUseID, _ := block["tool_use_id"].(string)
-				resultContent := extractToolResultContent(block["content"])
+				resultContent, resultImages := extractToolResultContent(block["content"])
+				if len(resultImages) > 0 {
+					images = append(images, resultImages...)
+					if strings.TrimSpace(resultContent) == "" {
+						resultContent = toolResultImagePlaceholder
+					}
+				}
 				toolResults = append(toolResults, KiroToolResult{
 					ToolUseID: toolUseID,
 					Content:   []KiroResultContent{{Text: resultContent}},
@@ -395,22 +426,33 @@ func extractImageFromClaudeBlock(block map[string]interface{}) *KiroImage {
 	return nil
 }
 
-func extractToolResultContent(content interface{}) string {
+func extractToolResultContent(content interface{}) (string, []KiroImage) {
 	if s, ok := content.(string); ok {
-		return s
+		return s, nil
 	}
 	if blocks, ok := content.([]interface{}); ok {
 		var parts []string
+		var images []KiroImage
 		for _, b := range blocks {
-			if block, ok := b.(map[string]interface{}); ok {
-				if text, ok := block["text"].(string); ok {
-					parts = append(parts, text)
+			block, ok := b.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			blockType, _ := block["type"].(string)
+			switch blockType {
+			case "image", "image_url", "input_image":
+				if img := extractImageFromClaudeBlock(block); img != nil {
+					images = append(images, *img)
+					continue
 				}
 			}
+			if text, ok := block["text"].(string); ok {
+				parts = append(parts, text)
+			}
 		}
-		return strings.Join(parts, "")
+		return strings.Join(parts, ""), images
 	}
-	return ""
+	return "", nil
 }
 
 func extractClaudeAssistantContent(content interface{}) (string, []KiroToolUse) {

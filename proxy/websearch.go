@@ -315,7 +315,9 @@ func buildWebSearchEvents(model, query, toolUseID string, results *webSearchResu
 		"type": "content_block_stop", "index": 1,
 	}})
 
-	// 4. web_search_tool_result block (index 2) - no tool_use_id field
+	// 4. web_search_tool_result block (index 2). Per the Anthropic contract this
+	// block must carry tool_use_id referencing the server_tool_use.id so clients
+	// can correlate the results with the tool call.
 	searchContent := make([]interface{}, 0)
 	if results != nil {
 		for _, r := range results.Results {
@@ -333,9 +335,13 @@ func buildWebSearchEvents(model, query, toolUseID string, results *webSearchResu
 		}
 	}
 	events = append(events, sseEvent{"content_block_start", map[string]interface{}{
-		"type":          "content_block_start",
-		"index":         2,
-		"content_block": map[string]interface{}{"type": "web_search_tool_result", "content": searchContent},
+		"type":  "content_block_start",
+		"index": 2,
+		"content_block": map[string]interface{}{
+			"type":        "web_search_tool_result",
+			"tool_use_id": toolUseID,
+			"content":     searchContent,
+		},
 	}})
 	events = append(events, sseEvent{"content_block_stop", map[string]interface{}{
 		"type": "content_block_stop", "index": 2,
@@ -449,52 +455,58 @@ func callKiroMCP(ctx context.Context, account *config.Account, requestBody []byt
 }
 
 // fetchWebSearchResults acquires an account, ensures its token, and performs the
-// MCP search call. Returns nil results (without error) on graceful degradation so
-// the caller still emits a well-formed "No results found" response.
-func (h *Handler) fetchWebSearchResults(ctx context.Context, query, apiKeyID, model string) (*webSearchResults, *config.Account, error) {
-	body, err := buildMCPRequestBody(newMCPRequestID(), query)
-	if err != nil {
-		return nil, nil, err
+// MCP search call. It returns:
+//   - err != nil: could not perform the search at all (no account / routing limit);
+//     the caller should return an HTTP error.
+//   - failed == true (err == nil): an account was obtained but the MCP call or
+//     result parsing failed; the caller degrades gracefully (emits a well-formed
+//     "No results found" response) but records the request as a failure so the
+//     upstream fault is visible in metrics rather than being masked as a 200.
+//   - failed == false, err == nil: genuine success (results may be empty).
+func (h *Handler) fetchWebSearchResults(ctx context.Context, query, apiKeyID, model string) (results *webSearchResults, account *config.Account, failed bool, err error) {
+	body, buildErr := buildMCPRequestBody(newMCPRequestID(), query)
+	if buildErr != nil {
+		return nil, nil, false, buildErr
 	}
 
 	excluded := make(map[string]bool)
 	var lastAccount *config.Account
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account, release, acquireErr := h.acquireRouteAccount(ctx, model, excluded, apiKeyID)
+		acct, release, acquireErr := h.acquireRouteAccount(ctx, model, excluded, apiKeyID)
 		if acquireErr != nil {
-			return nil, lastAccount, acquireErr
+			return nil, lastAccount, false, acquireErr
 		}
-		if err := h.ensureValidToken(account); err != nil {
+		if tokenErr := h.ensureValidToken(acct); tokenErr != nil {
 			release()
-			lastAccount = account
-			excluded[account.ID] = true
-			h.handleAccountFailure(account, err)
+			lastAccount = acct
+			excluded[acct.ID] = true
+			h.handleAccountFailure(acct, tokenErr)
 			continue
 		}
 
-		respBody, callErr := callKiroMCP(ctx, account, body)
+		respBody, callErr := callKiroMCP(ctx, acct, body)
 		release()
-		lastAccount = account
+		lastAccount = acct
 		if callErr != nil {
-			h.handleAccountFailure(account, callErr)
+			h.handleAccountFailure(acct, callErr)
 			if IsKiroRetryableAccountError(callErr) {
-				excluded[account.ID] = true
+				excluded[acct.ID] = true
 				continue
 			}
-			// Non-retryable: degrade gracefully (nil results, no error).
+			// Non-retryable: degrade gracefully but mark as failed for metrics.
 			logger.Warnf("[WebSearch] MCP call failed (non-retryable): %v", callErr)
-			return nil, account, nil
+			return nil, acct, true, nil
 		}
 
-		results, parseErr := parseMCPSearchResults(respBody)
+		parsed, parseErr := parseMCPSearchResults(respBody)
 		if parseErr != nil {
 			logger.Warnf("[WebSearch] failed to parse MCP results: %v", parseErr)
-			return nil, account, nil
+			return nil, acct, true, nil
 		}
-		return results, account, nil
+		return parsed, acct, false, nil
 	}
-	// Exhausted retries: degrade gracefully.
-	return nil, lastAccount, nil
+	// Exhausted retries: degrade gracefully but mark as failed for metrics.
+	return nil, lastAccount, true, nil
 }
 
 // ==================== Handler entry ====================
@@ -511,7 +523,7 @@ func (h *Handler) handleClaudeWebSearch(ctx context.Context, w http.ResponseWrit
 		return
 	}
 
-	results, account, err := h.fetchWebSearchResults(ctx, query, apiKeyID, model)
+	results, account, failed, err := h.fetchWebSearchResults(ctx, query, apiKeyID, model)
 	if err != nil {
 		if isRoutingLimitError(err) {
 			h.recordFailure()
@@ -521,7 +533,8 @@ func (h *Handler) handleClaudeWebSearch(ctx context.Context, w http.ResponseWrit
 			return
 		}
 		h.recordFailure()
-		recordRequestMetrics("claude", model, req.Stream, nil, apiKeyID, false, http.StatusServiceUnavailable, "no_available_accounts", estimatedInputTokens, 0, 0, requestStartedAt)
+		statusCode, errType := metricsErrorDetails(err, http.StatusServiceUnavailable, "no_available_accounts")
+		recordRequestMetrics("claude", model, req.Stream, nil, apiKeyID, false, statusCode, errType, estimatedInputTokens, 0, 0, requestStartedAt)
 		h.sendClaudeError(w, 503, "api_error", "No available accounts")
 		return
 	}
@@ -539,10 +552,18 @@ func (h *Handler) handleClaudeWebSearch(ctx context.Context, w http.ResponseWrit
 		}
 	}
 
-	h.recordSuccessForApiKey(apiKeyID, estimatedInputTokens, outputTokens, 0)
-	recordRequestMetrics("claude", model, req.Stream, account, apiKeyID, true, http.StatusOK, "", estimatedInputTokens, outputTokens, 0, requestStartedAt)
-	if account != nil {
-		h.pool.RecordSuccess(account.ID)
+	// The MCP search failed but we still emit a well-formed (empty) response to
+	// the client. Record it as a failure so the upstream fault is visible in
+	// metrics instead of being masked as a successful 200.
+	if failed {
+		h.recordFailure()
+		recordRequestMetrics("claude", model, req.Stream, account, apiKeyID, false, http.StatusBadGateway, "web_search_upstream_error", estimatedInputTokens, outputTokens, 0, requestStartedAt)
+	} else {
+		h.recordSuccessForApiKey(apiKeyID, estimatedInputTokens, outputTokens, 0)
+		recordRequestMetrics("claude", model, req.Stream, account, apiKeyID, true, http.StatusOK, "", estimatedInputTokens, outputTokens, 0, requestStartedAt)
+		if account != nil {
+			h.pool.RecordSuccess(account.ID)
+		}
 	}
 
 	if req.Stream {
@@ -590,7 +611,7 @@ func (h *Handler) writeWebSearchJSON(w http.ResponseWriter, model, query, toolUs
 	content := []interface{}{
 		map[string]interface{}{"type": "text", "text": fmt.Sprintf("I'll search for \"%s\".", query)},
 		map[string]interface{}{"id": toolUseID, "type": "server_tool_use", "name": "web_search", "input": map[string]interface{}{"query": query}},
-		map[string]interface{}{"type": "web_search_tool_result", "content": searchContent},
+		map[string]interface{}{"type": "web_search_tool_result", "tool_use_id": toolUseID, "content": searchContent},
 		map[string]interface{}{"type": "text", "text": generateWebSearchSummary(query, results)},
 	}
 

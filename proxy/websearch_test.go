@@ -265,6 +265,12 @@ func TestBuildWebSearchEventsSequence(t *testing.T) {
 				t.Fatalf("server_tool_use id/name mismatch: %+v", cb)
 			}
 		}
+		// web_search_tool_result must reference the server_tool_use via tool_use_id.
+		if ct, _ := cb["type"].(string); ct == "web_search_tool_result" {
+			if cb["tool_use_id"] != "srvtoolu_abc" {
+				t.Fatalf("web_search_tool_result missing/incorrect tool_use_id: %+v", cb)
+			}
+		}
 	}
 
 	// message_delta must report web_search_requests and omit stop_sequence.

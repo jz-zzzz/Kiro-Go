@@ -180,7 +180,7 @@ func (h *Handler) handleResponsesNonStream(
 			},
 		}
 
-		err := CallKiroAPI(account, payload, callback)
+		err := CallKiroAPI(ctx, account, payload, callback)
 		release()
 		if err != nil {
 			lastErr = err
@@ -511,7 +511,7 @@ func (h *Handler) handleResponsesStream(
 			},
 		}
 
-		err := CallKiroAPI(account, payload, callback)
+		err := CallKiroAPI(ctx, account, payload, callback)
 		release()
 		if err != nil {
 			if !responseStarted {

@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"strconv"
@@ -10,7 +11,7 @@ import (
 )
 
 // parseEventStream decodes an AWS binary Event Stream response body.
-func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
+func parseEventStream(ctx context.Context, body io.Reader, callback *KiroStreamCallback) error {
 	if callback == nil {
 		callback = &KiroStreamCallback{}
 	}
@@ -23,6 +24,16 @@ func parseEventStream(body io.Reader, callback *KiroStreamCallback) error {
 	var lastReasoningContent string
 
 	for {
+		// Stop promptly if the client disconnected or the request was cancelled,
+		// so we don't keep reading from / writing to a dead connection.
+		if ctx != nil {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
+			}
+		}
+
 		// Prelude: 12 bytes (total_len + headers_len + crc)
 		prelude := make([]byte, 12)
 		_, err := io.ReadFull(body, prelude)

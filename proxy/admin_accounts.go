@@ -468,7 +468,7 @@ func (h *Handler) apiTestAccount(w http.ResponseWriter, r *http.Request, id stri
 		OnContextUsage: func(pct float64) {},
 	}
 
-	err := CallKiroAPI(account, kiroPayload, callback)
+	err := CallKiroAPI(r.Context(), account, kiroPayload, callback)
 	if err != nil {
 		h.handleAccountTestFailure(account, err)
 		w.WriteHeader(500)

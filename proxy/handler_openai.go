@@ -421,7 +421,7 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 			},
 		}
 
-		err := CallKiroAPI(account, payload, callback)
+		err := CallKiroAPI(ctx, account, payload, callback)
 		release()
 		if err != nil {
 			lastErr = err
@@ -562,7 +562,7 @@ func (h *Handler) handleOpenAINonStream(ctx context.Context, w http.ResponseWrit
 			},
 		}
 
-		err := CallKiroAPI(account, payload, callback)
+		err := CallKiroAPI(ctx, account, payload, callback)
 		release()
 		if err != nil {
 			lastErr = err

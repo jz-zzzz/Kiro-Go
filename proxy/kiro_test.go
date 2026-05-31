@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"kiro-go/config"
@@ -54,7 +55,7 @@ func TestParseEventStreamFinishesPendingToolUseOnEOF(t *testing.T) {
 
 	var toolUses []KiroToolUse
 	var completed bool
-	err := parseEventStream(stream, &KiroStreamCallback{
+	err := parseEventStream(context.Background(), stream, &KiroStreamCallback{
 		OnToolUse: func(toolUse KiroToolUse) {
 			toolUses = append(toolUses, toolUse)
 		},
@@ -92,7 +93,7 @@ func TestParseEventStreamNilCallbackIsNoOp(t *testing.T) {
 		}),
 	}, nil))
 
-	if err := parseEventStream(stream, nil); err != nil {
+	if err := parseEventStream(context.Background(), stream, nil); err != nil {
 		t.Fatalf("expected nil callback to be a no-op, got %v", err)
 	}
 }
@@ -102,7 +103,7 @@ func TestParseEventStreamNilCallbackFieldsAreNoOp(t *testing.T) {
 		"content": "hello",
 	}))
 
-	if err := parseEventStream(stream, &KiroStreamCallback{}); err != nil {
+	if err := parseEventStream(context.Background(), stream, &KiroStreamCallback{}); err != nil {
 		t.Fatalf("expected empty callback to be a no-op, got %v", err)
 	}
 }

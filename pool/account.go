@@ -144,7 +144,7 @@ func (p *AccountPool) GetNextExcluding(excluded map[string]bool) *config.Account
 	p.refreshAutoRestoredAccounts()
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	return p.getNextLockedExcept("", excluded)
+	return copyAccount(p.getNextLockedExcept("", excluded))
 }
 
 // GetNextExcept 获取下一个可用账号，并排除已尝试的账号。
@@ -152,7 +152,7 @@ func (p *AccountPool) GetNextExcept(exclude map[string]bool) *config.Account {
 	p.refreshAutoRestoredAccounts()
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	return p.getNextLockedExcept("", exclude)
+	return copyAccount(p.getNextLockedExcept("", exclude))
 }
 
 // SetModelList 缓存账号支持的模型集合（由 handler 在刷新后调用）
@@ -204,7 +204,7 @@ func (p *AccountPool) GetNextForModelExcluding(model string, excluded map[string
 	p.refreshAutoRestoredAccounts()
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	return p.getNextLockedExcept(model, excluded)
+	return copyAccount(p.getNextLockedExcept(model, excluded))
 }
 
 // GetNextForModelExcept 获取下一个支持指定模型的可用账号，并排除已尝试账号。
@@ -212,7 +212,7 @@ func (p *AccountPool) GetNextForModelExcept(model string, exclude map[string]boo
 	p.refreshAutoRestoredAccounts()
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	return p.getNextLockedExcept(model, exclude)
+	return copyAccount(p.getNextLockedExcept(model, exclude))
 }
 
 func needsTokenRefresh(acc config.Account, now time.Time) bool {
@@ -225,6 +225,18 @@ func hasRefreshToken(acc config.Account) bool {
 
 func canRouteByToken(acc config.Account, now time.Time) bool {
 	return !needsTokenRefresh(acc, now) || hasRefreshToken(acc)
+}
+
+// copyAccount returns a value copy of the account so callers receive a snapshot
+// detached from the pool's backing slice. config.Account is a pure data struct
+// (no mutex/sync fields), so a shallow copy is safe and prevents callers from
+// racing with in-pool mutations (token refresh, stats updates, reloads).
+func copyAccount(acc *config.Account) *config.Account {
+	if acc == nil {
+		return nil
+	}
+	cp := *acc
+	return &cp
 }
 
 func (p *AccountPool) getNextLockedExcept(model string, exclude map[string]bool) *config.Account {
@@ -461,7 +473,7 @@ func (p *AccountPool) tryAcquireForModel(model string, excluded map[string]bool,
 			}
 			if acc, considered := tryAccount(&p.accounts[i]); acc != nil || considered {
 				if acc != nil || !rc.OverflowToOtherAccounts {
-					return routingTryResult{account: acc, busy: acc == nil, wait: earliestWait, notify: p.routeNotify}, nil
+					return routingTryResult{account: copyAccount(acc), busy: acc == nil, wait: earliestWait, notify: p.routeNotify}, nil
 				}
 				break
 			}
@@ -482,7 +494,7 @@ func (p *AccountPool) tryAcquireForModel(model string, excluded map[string]bool,
 		}
 		seen[acc.ID] = true
 		if selected, _ := tryAccount(acc); selected != nil {
-			return routingTryResult{account: selected}, nil
+			return routingTryResult{account: copyAccount(selected)}, nil
 		}
 	}
 	return routingTryResult{busy: busySeen, wait: earliestWait, notify: p.routeNotify}, nil
@@ -670,7 +682,7 @@ func (p *AccountPool) GetByID(id string) *config.Account {
 	defer p.mu.RUnlock()
 	for i := range p.accounts {
 		if p.accounts[i].ID == id {
-			return &p.accounts[i]
+			return copyAccount(&p.accounts[i])
 		}
 	}
 	return nil

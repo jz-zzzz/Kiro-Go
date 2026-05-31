@@ -604,6 +604,7 @@
   "live.enqueuedSub": "累计进入排队的请求数",
   "live.processed": "已处理",
   "live.processedSub": "累计成功获得路由的请求数",
+  "live.queue": "队列统计",
   "live.rejected": "已拒绝",
   "live.rejectedSub": "因队列已满被拒绝的请求数",
   "live.timeout": "超时",

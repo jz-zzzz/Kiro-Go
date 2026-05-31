@@ -604,6 +604,7 @@
   "live.enqueuedSub": "Total requests that entered the queue",
   "live.processed": "Processed",
   "live.processedSub": "Total requests that acquired a route",
+  "live.queue": "Queue Stats",
   "live.rejected": "Rejected",
   "live.rejectedSub": "Requests rejected because the queue was full",
   "live.timeout": "Timeout",

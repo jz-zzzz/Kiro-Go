@@ -677,24 +677,25 @@
             <div class="metric-sub" data-i18n="live.waitingSub"></div>
           </div>
           <div class="metric-card">
-            <div class="metric-label" data-i18n="live.enqueued"></div>
-            <div class="metric-value" id="liveEnqueued">0</div>
-            <div class="metric-sub" data-i18n="live.enqueuedSub"></div>
-          </div>
-          <div class="metric-card">
-            <div class="metric-label" data-i18n="live.processed"></div>
-            <div class="metric-value" id="liveProcessed">0</div>
-            <div class="metric-sub" data-i18n="live.processedSub"></div>
-          </div>
-          <div class="metric-card">
-            <div class="metric-label" data-i18n="live.rejected"></div>
-            <div class="metric-value metric-danger" id="liveRejected">0</div>
-            <div class="metric-sub" data-i18n="live.rejectedSub"></div>
-          </div>
-          <div class="metric-card">
-            <div class="metric-label" data-i18n="live.timeout"></div>
-            <div class="metric-value metric-danger" id="liveTimeout">0</div>
-            <div class="metric-sub" data-i18n="live.timeoutSub"></div>
+            <div class="metric-label" data-i18n="live.queue"></div>
+            <div class="queue-grid">
+              <div class="queue-item">
+                <span class="queue-value" id="liveEnqueued">0</span>
+                <span class="queue-sub" data-i18n="live.enqueued"></span>
+              </div>
+              <div class="queue-item">
+                <span class="queue-value" id="liveProcessed">0</span>
+                <span class="queue-sub" data-i18n="live.processed"></span>
+              </div>
+              <div class="queue-item">
+                <span class="queue-value metric-danger" id="liveRejected">0</span>
+                <span class="queue-sub" data-i18n="live.rejected"></span>
+              </div>
+              <div class="queue-item">
+                <span class="queue-value metric-danger" id="liveTimeout">0</span>
+                <span class="queue-sub" data-i18n="live.timeout"></span>
+              </div>
+            </div>
           </div>
           <div class="metric-card">
             <div class="metric-label" data-i18n="live.requestsPerMinute"></div>

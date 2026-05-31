@@ -4306,13 +4306,39 @@ img.brand-icon {
 
 /* Live concurrency panel */
 .live-grid {
-  grid-template-columns: repeat(7, minmax(0, 1fr));
+  grid-template-columns: repeat(5, 1fr);
 }
 
 .metric-limit {
   font-size: 0.9rem;
   font-weight: 600;
   color: var(--muted-foreground);
+}
+
+/* Queue statistics mini-grid inside the queue card */
+.queue-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.25rem 0.75rem;
+  width: 100%;
+}
+.queue-item {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0;
+}
+.queue-value {
+  font-size: 1.1rem;
+  font-weight: 700;
+  line-height: 1.3;
+  color: var(--foreground);
+}
+.queue-sub {
+  font-size: 0.7rem;
+  color: var(--muted-foreground);
+  white-space: nowrap;
+  line-height: 1.2;
 }
 
 .live-auto {

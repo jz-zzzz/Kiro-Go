@@ -544,11 +544,12 @@ func buildMetricsTop(rangeDur time.Duration, groupBy, metric string, limit int) 
 func metricGroupKey(b MetricsBucket, groupBy string) (string, string) {
 	switch strings.ToLower(groupBy) {
 	case "account", "accounts":
-		label := b.AccountEmail
-		if label == "" {
-			label = b.AccountID
+		// 按 email 分组：同一账号被重复导入会生成不同 AccountID，
+		// 若按 ID 分组会在 Top 列表里裂成多行。用 email 作为分组键可合并。
+		if b.AccountEmail != "" {
+			return "email:" + b.AccountEmail, b.AccountEmail
 		}
-		return b.AccountID, label
+		return b.AccountID, b.AccountID
 	case "apikey", "api_key", "key":
 		label := b.APIKeyName
 		if label == "" {

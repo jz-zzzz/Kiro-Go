@@ -4078,6 +4078,11 @@ img.brand-icon {
   min-width: 9rem;
 }
 
+.metrics-actions .custom-select {
+  flex: 0 0 auto;
+  width: 9rem;
+}
+
 .metrics-grid {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -4250,6 +4255,7 @@ img.brand-icon {
 
   .metrics-actions,
   .metrics-actions .btn,
+  .metrics-actions .custom-select,
   .metrics-select {
     width: 100%;
   }
@@ -4263,7 +4269,7 @@ img.brand-icon {
 
 /* Live concurrency panel */
 .live-grid {
-  grid-template-columns: repeat(6, minmax(0, 1fr));
+  grid-template-columns: repeat(7, minmax(0, 1fr));
 }
 
 .metric-limit {

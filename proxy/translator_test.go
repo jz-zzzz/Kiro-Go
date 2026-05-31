@@ -236,6 +236,68 @@ func TestOpenAIConversationIDRandomForSyntheticAnchor(t *testing.T) {
 	}
 }
 
+func TestClaudeRoutingAffinityKeyStableAcrossTurns(t *testing.T) {
+	reqA := &ClaudeRequest{
+		Model:    "claude-sonnet-4.5",
+		System:   "sys",
+		Messages: []ClaudeMessage{{Role: "user", Content: "hello"}},
+	}
+	reqB := &ClaudeRequest{
+		Model:  "claude-sonnet-4.5",
+		System: "sys",
+		Messages: []ClaudeMessage{
+			{Role: "user", Content: "hello"},
+			{Role: "assistant", Content: "ok"},
+			{Role: "user", Content: "next"},
+		},
+	}
+
+	a := ClaudeToKiro(reqA, false)
+	b := ClaudeToKiro(reqB, false)
+
+	if a.RoutingAffinityKey == "" {
+		t.Fatal("expected non-empty affinity key for a real conversation anchor")
+	}
+	if a.RoutingAffinityKey != b.RoutingAffinityKey {
+		t.Fatalf("affinity key should be stable across turns, got %q vs %q", a.RoutingAffinityKey, b.RoutingAffinityKey)
+	}
+	// The affinity key should equal the (deterministic) conversation ID.
+	if a.RoutingAffinityKey != a.ConversationState.ConversationID {
+		t.Fatalf("affinity key %q should match conversation ID %q", a.RoutingAffinityKey, a.ConversationState.ConversationID)
+	}
+}
+
+func TestClaudeRoutingAffinityKeyEmptyForSyntheticAnchor(t *testing.T) {
+	// Leading assistant-only message → synthetic anchor → random conversation ID,
+	// so the affinity key must be empty to avoid pinning on an unstable key.
+	req := &ClaudeRequest{
+		Model:    "claude-sonnet-4.5",
+		Messages: []ClaudeMessage{{Role: "assistant", Content: "prefill"}},
+	}
+	payload := ClaudeToKiro(req, false)
+	if payload.RoutingAffinityKey != "" {
+		t.Fatalf("expected empty affinity key for synthetic anchor, got %q", payload.RoutingAffinityKey)
+	}
+}
+
+func TestOpenAIRoutingAffinityKeyStableAcrossTurns(t *testing.T) {
+	base := []OpenAIMessage{
+		{Role: "system", Content: "sys"},
+		{Role: "user", Content: "Build calculator"},
+		{Role: "assistant", Content: "Sure"},
+		{Role: "user", Content: "Continue"},
+	}
+	a := OpenAIToKiro(&OpenAIRequest{Model: "claude-sonnet-4.5", Messages: base}, false)
+	b := OpenAIToKiro(&OpenAIRequest{Model: "claude-sonnet-4.5", Messages: append(base, OpenAIMessage{Role: "assistant", Content: "Next"})}, false)
+
+	if a.RoutingAffinityKey == "" {
+		t.Fatal("expected non-empty affinity key for a real conversation anchor")
+	}
+	if a.RoutingAffinityKey != b.RoutingAffinityKey {
+		t.Fatalf("affinity key should be stable across turns, got %q vs %q", a.RoutingAffinityKey, b.RoutingAffinityKey)
+	}
+}
+
 func TestClaudeToKiroDropsLeadingAssistantHistory(t *testing.T) {
 	req := &ClaudeRequest{
 		Model: "claude-sonnet-4.5",

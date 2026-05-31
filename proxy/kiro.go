@@ -168,6 +168,13 @@ type KiroPayload struct {
 	// to strict clients such as Claude Code.
 	// Not serialized to the Kiro API request body.
 	ToolSchemas map[string]interface{} `json:"-"`
+
+	// RoutingAffinityKey is a stable per-conversation fingerprint used to pin
+	// all turns of the same conversation to the same upstream account, so the
+	// account's prompt cache can be reused across turns. Empty when the request
+	// has no stable conversation anchor (single-shot / synthetic), in which case
+	// routing falls back to normal load balancing. Not serialized to Kiro.
+	RoutingAffinityKey string `json:"-"`
 }
 
 type KiroUserInputMessage struct {

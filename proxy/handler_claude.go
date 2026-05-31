@@ -268,7 +268,7 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 	}
 
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account, release, acquireErr := h.acquireRouteAccount(ctx, model, excluded, apiKeyID)
+		account, release, acquireErr := h.acquireRouteAccount(ctx, model, excluded, payload.RoutingAffinityKey)
 		if acquireErr != nil {
 			if isRoutingLimitError(acquireErr) {
 				h.recordFailure()
@@ -713,7 +713,7 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 	}()
 
 	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
-		account, release, acquireErr := h.acquireRouteAccount(ctx, model, excluded, apiKeyID)
+		account, release, acquireErr := h.acquireRouteAccount(ctx, model, excluded, payload.RoutingAffinityKey)
 		if acquireErr != nil {
 			if isRoutingLimitError(acquireErr) {
 				h.recordFailure()

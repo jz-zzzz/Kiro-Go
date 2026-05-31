@@ -175,7 +175,14 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	payload.ConversationState.ChatTriggerType = "MANUAL"
 	payload.ConversationState.AgentTaskType = "vibe"
 	payload.ConversationState.AgentContinuationId = uuid.New().String()
-	payload.ConversationState.ConversationID = buildConversationID(modelID, systemPrompt, firstClaudeConversationAnchor(req.Messages))
+	claudeAnchor := firstClaudeConversationAnchor(req.Messages)
+	payload.ConversationState.ConversationID = buildConversationID(modelID, systemPrompt, claudeAnchor)
+	// Pin all turns of the same conversation to one account (prompt-cache reuse)
+	// only when the anchor is stable; synthetic anchors yield a random ID per
+	// request, so leave the affinity key empty to fall back to load balancing.
+	if !isSyntheticConversationAnchor(claudeAnchor) {
+		payload.RoutingAffinityKey = payload.ConversationState.ConversationID
+	}
 	payload.ConversationState.CurrentMessage.UserInputMessage = KiroUserInputMessage{
 		Content: finalContent,
 		ModelID: modelID,

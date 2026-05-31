@@ -211,7 +211,14 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 	payload := &KiroPayload{}
 	payload.ToolSchemas = buildOpenAIToolSchemaMap(req.Tools)
 	payload.ConversationState.ChatTriggerType = "MANUAL"
-	payload.ConversationState.ConversationID = buildConversationID(modelID, systemPrompt, firstOpenAIConversationAnchor(nonSystemMessages))
+	openaiAnchor := firstOpenAIConversationAnchor(nonSystemMessages)
+	payload.ConversationState.ConversationID = buildConversationID(modelID, systemPrompt, openaiAnchor)
+	// Pin all turns of the same conversation to one account (prompt-cache reuse)
+	// only when the anchor is stable; synthetic anchors yield a random ID per
+	// request, so leave the affinity key empty to fall back to load balancing.
+	if !isSyntheticConversationAnchor(openaiAnchor) {
+		payload.RoutingAffinityKey = payload.ConversationState.ConversationID
+	}
 	payload.ConversationState.CurrentMessage.UserInputMessage = KiroUserInputMessage{
 		Content: finalContent,
 		ModelID: modelID,

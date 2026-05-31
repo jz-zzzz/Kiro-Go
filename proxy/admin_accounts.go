@@ -46,8 +46,13 @@ func (h *Handler) apiGetAccounts(w http.ResponseWriter, r *http.Request) {
 	now := time.Now().Unix()
 	result := make([]map[string]interface{}, len(accounts))
 	for i, a := range accounts {
-		// 获取运行时统计
-		stats := statsMap[a.ID]
+		// 获取运行时统计：优先使用内存池中的实时值；
+		// 若账号因 429 冷却/超额被移出池子（reloadLocked 会跳过被挂起的账号），
+		// 则回退到 config 中持久化的统计值，避免请求数等指标在冷却期间显示为 0。
+		stats := a
+		if poolStat, ok := statsMap[a.ID]; ok {
+			stats = poolStat
+		}
 		health := healthSnapshots[a.ID]
 		coolingUntil := health.CoolingUntil
 		recent429Count, probe429Rate := getKiro429ProbeRate(a.ID)
@@ -610,8 +615,9 @@ func (h *Handler) apiGetAccountFull(w http.ResponseWriter, r *http.Request, id s
 		return
 	}
 
-	// 获取运行时统计
-	var stats config.Account
+	// 获取运行时统计：优先内存池实时值，否则回退到 config 持久值
+	// （429 冷却/超额账号会被移出池子，此时内存池查不到）。
+	stats := *account
 	for _, a := range poolAccounts {
 		if a.ID == id {
 			stats = a

@@ -303,6 +303,29 @@
             </div>
             <small data-i18n="apiKeys.listHint"></small>
           </div>
+
+          <div class="toolbar apikeys-toolbar" id="apiKeysToolbar" hidden>
+            <div class="view-toggle" role="group" data-i18n-aria-label="apiKeys.viewMode">
+              <button class="view-toggle-btn" type="button" data-apikey-view-mode="table" data-i18n="apiKeys.viewTable"></button>
+              <button class="view-toggle-btn" type="button" data-apikey-view-mode="card" data-i18n="apiKeys.viewCard"></button>
+            </div>
+            <div class="filter-grid apikeys-filter-grid">
+              <input type="text" id="apiKeyFilterSearch" data-i18n-placeholder="apiKeys.filterSearch" />
+              <select id="apiKeyFilterStatusSelect" data-i18n-aria-label="apiKeys.filterStatus">
+                <option value="all" data-i18n="apiKeys.filterAll"></option>
+                <option value="enabled" data-i18n="apiKeys.filterEnabled"></option>
+                <option value="disabled" data-i18n="apiKeys.filterDisabled"></option>
+                <option value="migrated" data-i18n="apiKeys.filterMigrated"></option>
+              </select>
+              <select id="apiKeyFilterSortSelect" data-i18n-aria-label="apiKeys.filterSort">
+                <option value="created" data-i18n="apiKeys.sortCreated"></option>
+                <option value="requests" data-i18n="apiKeys.sortRequests"></option>
+                <option value="tokens" data-i18n="apiKeys.sortTokens"></option>
+                <option value="credits" data-i18n="apiKeys.sortCredits"></option>
+                <option value="name" data-i18n="apiKeys.sortName"></option>
+              </select>
+            </div>
+          </div>
           <div id="apiKeysList"></div>
         </div>
         </div>

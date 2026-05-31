@@ -2390,6 +2390,10 @@
   let apiKeysCache = [];
   let apiKeyEditingId = '';
   let apiKeyModalSubmitting = false;
+  let apiKeyFilterKeyword = '';
+  let apiKeyFilterStatus = 'all';
+  let apiKeyFilterSort = localStorage.getItem('apiKeyFilterSort') || 'created';
+  let apiKeyViewMode = localStorage.getItem('apiKeyViewMode') === 'card' ? 'card' : 'table';
 
   async function loadApiKeys() {
     const list = $('apiKeysList');
@@ -2433,42 +2437,79 @@
     return '<div class="text-xs muted-text">' + escapeHtml(label) + ': ' + escapeHtml(fmt(used)) + ' / ' + escapeHtml(fmt(limit)) + '</div>' + usageBar(used, limit);
   }
 
-  function renderApiKeys() {
-    const list = $('apiKeysList');
-    if (!list) return;
-    if (!apiKeysCache.length) {
-      list.innerHTML = '<div class="muted-text" style="padding:0.5rem 0;">' + escapeHtml(t('apiKeys.empty')) + '</div>';
-      return;
-    }
-    const html = apiKeysCache.map(item => {
+  function apiKeyMatchesStatus(item) {
+    if (apiKeyFilterStatus === 'all') return true;
+    if (apiKeyFilterStatus === 'enabled') return !!item.enabled;
+    if (apiKeyFilterStatus === 'disabled') return !item.enabled;
+    if (apiKeyFilterStatus === 'migrated') return !!item.migrated;
+    return true;
+  }
+  function apiKeySearchText(item) {
+    return [item.name, item.keyMasked].filter(Boolean).join(' ').toLowerCase();
+  }
+  function apiKeySortValue(item) {
+    if (apiKeyFilterSort === 'requests') return Number(item.requestsCount || 0);
+    if (apiKeyFilterSort === 'tokens') return Number(item.tokensUsed || 0);
+    if (apiKeyFilterSort === 'credits') return Number(item.creditsUsed || 0);
+    return Number(item.createdAt || 0);
+  }
+  function getFilteredApiKeys() {
+    const kw = apiKeyFilterKeyword.trim().toLowerCase();
+    const list = apiKeysCache.filter(item => {
+      if (!apiKeyMatchesStatus(item)) return false;
+      if (kw && !apiKeySearchText(item).includes(kw)) return false;
+      return true;
+    });
+    return list.sort((a, b) => {
+      if (apiKeyFilterSort === 'name') {
+        return String(a.name || '').localeCompare(String(b.name || ''));
+      }
+      const av = apiKeySortValue(a);
+      const bv = apiKeySortValue(b);
+      if (bv !== av) return bv - av;
+      return String(a.name || '').localeCompare(String(b.name || ''));
+    });
+  }
+  function apiKeyBadges(item) {
+    const migrated = item.migrated
+      ? '<span class="text-xs" style="background:rgba(59,130,246,0.15);color:#3b82f6;padding:1px 6px;border-radius:4px;">' + escapeHtml(t('apiKeys.migrated')) + '</span>'
+      : '';
+    const disabled = !item.enabled
+      ? '<span class="text-xs" style="background:rgba(239,68,68,0.15);color:#ef4444;padding:1px 6px;border-radius:4px;">' + escapeHtml(t('apiKeys.disabled')) + '</span>'
+      : '';
+    return migrated + disabled;
+  }
+  function apiKeyName(item) {
+    return item.name ? escapeHtml(item.name) : '<span class="muted-text">' + escapeHtml(t('apiKeys.unnamed')) + '</span>';
+  }
+  function apiKeyActionButtons(id) {
+    return '<button class="btn btn-outline btn-sm" type="button" data-apikey-action="edit" data-id="' + id + '">' + escapeHtml(t('apiKeys.actionEdit')) + '</button>' +
+      '<button class="btn btn-outline btn-sm" type="button" data-apikey-action="reset" data-id="' + id + '">' + escapeHtml(t('apiKeys.actionReset')) + '</button>' +
+      '<button class="btn btn-danger btn-sm" type="button" data-apikey-action="delete" data-id="' + id + '">' + escapeHtml(t('apiKeys.actionDelete')) + '</button>';
+  }
+  function apiKeyToggle(id, enabled) {
+    return '<label class="switch" title="' + escapeAttr(enabled ? t('accounts.disable') : t('accounts.enable')) + '">' +
+      '<input type="checkbox" data-apikey-action="toggle" data-id="' + id + '"' + (enabled ? ' checked' : '') + ' />' +
+      '<span class="slider"></span>' +
+      '</label>';
+  }
+  function renderApiKeysCardView(filtered) {
+    return filtered.map(item => {
       const id = escapeAttr(item.id || '');
-      const name = item.name ? escapeHtml(item.name) : '<span class="muted-text">' + escapeHtml(t('apiKeys.unnamed')) + '</span>';
       const masked = escapeHtml(item.keyMasked || '');
-      const migrated = item.migrated
-        ? '<span class="text-xs" style="background:rgba(59,130,246,0.15);color:#3b82f6;padding:1px 6px;border-radius:4px;">' + escapeHtml(t('apiKeys.migrated')) + '</span>'
-        : '';
-      const disabled = !item.enabled
-        ? '<span class="text-xs" style="background:rgba(239,68,68,0.15);color:#ef4444;padding:1px 6px;border-radius:4px;">' + escapeHtml(t('apiKeys.disabled')) + '</span>'
-        : '';
       const tokensLine = usageLine(t('apiKeys.tokens'), item.tokensUsed || 0, item.tokenLimit || 0);
       const creditsLine = usageLine(t('apiKeys.credits'), item.creditsUsed || 0, item.creditLimit || 0);
       const requestsLine = '<div class="text-xs muted-text">' + escapeHtml(t('apiKeys.requests')) + ': ' + escapeHtml(formatNumber(item.requestsCount || 0)) + '</div>';
       return '<div class="card" data-apikey-id="' + id + '" style="margin-top:0.5rem;padding:0.75rem;">' +
         '<div class="flex items-center gap-2" style="flex-wrap:wrap;justify-content:space-between;">' +
           '<div class="flex items-center gap-2" style="flex-wrap:wrap;">' +
-            '<span class="font-semibold">' + name + '</span>' +
-            migrated +
-            disabled +
+            '<span class="font-semibold">' + apiKeyName(item) + '</span>' +
+            apiKeyBadges(item) +
             '<span class="text-xs muted-text font-mono">' + masked + '</span>' +
           '</div>' +
           '<div class="flex items-center gap-2">' +
-            '<label class="switch" title="' + escapeAttr(item.enabled ? t('accounts.disable') : t('accounts.enable')) + '">' +
-              '<input type="checkbox" data-apikey-action="toggle" data-id="' + id + '"' + (item.enabled ? ' checked' : '') + ' />' +
-              '<span class="slider"></span>' +
-            '</label>' +
-            '<button class="btn btn-outline btn-sm" type="button" data-apikey-action="edit" data-id="' + id + '">' + escapeHtml(t('apiKeys.actionEdit')) + '</button>' +
-            '<button class="btn btn-outline btn-sm" type="button" data-apikey-action="reset" data-id="' + id + '">' + escapeHtml(t('apiKeys.actionReset')) + '</button>' +
-            '<button class="btn btn-danger btn-sm" type="button" data-apikey-action="delete" data-id="' + id + '">' + escapeHtml(t('apiKeys.actionDelete')) + '</button>' +
+            apiKeyToggle(id, item.enabled) +
+            apiKeyActionButtons(id) +
           '</div>' +
         '</div>' +
         '<div style="margin-top:0.5rem;display:grid;gap:0.35rem;">' +
@@ -2478,7 +2519,68 @@
         '</div>' +
       '</div>';
     }).join('');
-    list.innerHTML = html;
+  }
+  function apiKeyUsageCell(label, used, limit) {
+    const fmt = formatNumber;
+    if (!limit || limit <= 0) {
+      return '<strong>' + escapeHtml(fmt(used)) + '</strong><span class="apikey-list-sub">/ ' + escapeHtml(t('apiKeys.unlimited')) + '</span>';
+    }
+    return '<strong>' + escapeHtml(fmt(used)) + '</strong><span class="apikey-list-sub">/ ' + escapeHtml(fmt(limit)) + '</span>' + usageBar(used, limit);
+  }
+  function renderApiKeysTableView(filtered) {
+    const rows = filtered.map(item => {
+      const id = escapeAttr(item.id || '');
+      const masked = escapeHtml(item.keyMasked || '');
+      const statusLabel = item.enabled ? t('apiKeys.statusEnabled') : t('apiKeys.statusDisabled');
+      const statusClass = item.enabled ? 'text-success' : 'text-danger';
+      return '<div class="apikey-list-row" data-apikey-id="' + id + '">' +
+        '<div class="apikey-list-cell apikey-list-name"><div class="apikey-name-row"><span class="font-semibold">' + apiKeyName(item) + '</span>' + apiKeyBadges(item) + '</div></div>' +
+        '<div class="apikey-list-cell apikey-list-key"><span class="text-xs muted-text font-mono">' + masked + '</span></div>' +
+        '<div class="apikey-list-cell apikey-list-status"><span class="list-cell-label">' + escapeHtml(t('apiKeys.colStatus')) + '</span>' + apiKeyToggle(id, item.enabled) + '<span class="text-xs ' + statusClass + '">' + escapeHtml(statusLabel) + '</span></div>' +
+        '<div class="apikey-list-cell apikey-list-requests"><span class="list-cell-label">' + escapeHtml(t('apiKeys.requests')) + '</span><strong>' + escapeHtml(formatNumber(item.requestsCount || 0)) + '</strong></div>' +
+        '<div class="apikey-list-cell apikey-list-tokens"><span class="list-cell-label">' + escapeHtml(t('apiKeys.tokens')) + '</span>' + apiKeyUsageCell(t('apiKeys.tokens'), item.tokensUsed || 0, item.tokenLimit || 0) + '</div>' +
+        '<div class="apikey-list-cell apikey-list-credits"><span class="list-cell-label">' + escapeHtml(t('apiKeys.credits')) + '</span>' + apiKeyUsageCell(t('apiKeys.credits'), item.creditsUsed || 0, item.creditLimit || 0) + '</div>' +
+        '<div class="apikey-list-cell apikey-list-actions">' + apiKeyActionButtons(id) + '</div>' +
+        '</div>';
+    }).join('');
+    return '<div class="apikey-list-view">' +
+      '<div class="apikey-list-head">' +
+        '<span>' + escapeHtml(t('apiKeys.colName')) + '</span>' +
+        '<span>' + escapeHtml(t('apiKeys.colKey')) + '</span>' +
+        '<span>' + escapeHtml(t('apiKeys.colStatus')) + '</span>' +
+        '<span>' + escapeHtml(t('apiKeys.requests')) + '</span>' +
+        '<span>' + escapeHtml(t('apiKeys.tokens')) + '</span>' +
+        '<span>' + escapeHtml(t('apiKeys.credits')) + '</span>' +
+        '<span>' + escapeHtml(t('apiKeys.colActions')) + '</span>' +
+      '</div>' +
+      rows +
+      '</div>';
+  }
+  function renderApiKeysViewToggle() {
+    qsa('[data-apikey-view-mode]').forEach(btn => {
+      const active = btn.dataset.apikeyViewMode === apiKeyViewMode;
+      btn.classList.toggle('active', active);
+      btn.setAttribute('aria-pressed', String(active));
+    });
+  }
+  function renderApiKeys() {
+    const list = $('apiKeysList');
+    if (!list) return;
+    const toolbar = $('apiKeysToolbar');
+    if (toolbar) toolbar.hidden = apiKeysCache.length === 0;
+    if (!apiKeysCache.length) {
+      list.innerHTML = '<div class="muted-text" style="padding:0.5rem 0;">' + escapeHtml(t('apiKeys.empty')) + '</div>';
+      return;
+    }
+    renderApiKeysViewToggle();
+    const filtered = getFilteredApiKeys();
+    if (!filtered.length) {
+      list.innerHTML = '<div class="muted-text" style="padding:0.5rem 0;">' + escapeHtml(t('apiKeys.filterEmpty')) + '</div>';
+      return;
+    }
+    list.innerHTML = apiKeyViewMode === 'card'
+      ? renderApiKeysCardView(filtered)
+      : renderApiKeysTableView(filtered);
   }
 
   function openApiKeyModal(entry) {
@@ -2664,6 +2766,33 @@
     if (copyBtn) copyBtn.addEventListener('click', copyNewApiKey);
     bindDialogBackdropClose('apiKeyModal', closeApiKeyModal);
     bindDialogBackdropClose('apiKeyShowModal', closeShowApiKeyModal);
+
+    const search = $('apiKeyFilterSearch');
+    if (search) search.addEventListener('input', () => {
+      apiKeyFilterKeyword = search.value || '';
+      renderApiKeys();
+    });
+    const statusSel = $('apiKeyFilterStatusSelect');
+    if (statusSel) statusSel.addEventListener('change', () => {
+      apiKeyFilterStatus = statusSel.value || 'all';
+      renderApiKeys();
+    });
+    const sortSel = $('apiKeyFilterSortSelect');
+    if (sortSel) {
+      sortSel.value = apiKeyFilterSort;
+      sortSel.addEventListener('change', () => {
+        apiKeyFilterSort = sortSel.value || 'created';
+        localStorage.setItem('apiKeyFilterSort', apiKeyFilterSort);
+        renderApiKeys();
+      });
+    }
+    qsa('[data-apikey-view-mode]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        apiKeyViewMode = btn.dataset.apikeyViewMode === 'card' ? 'card' : 'table';
+        localStorage.setItem('apiKeyViewMode', apiKeyViewMode);
+        renderApiKeys();
+      });
+    });
   }
 
   // Prompt filter rules
@@ -3411,6 +3540,7 @@
     qsa('.tab-content').forEach(c => c.classList.add('hidden'));
     $('tab' + tab.charAt(0).toUpperCase() + tab.slice(1)).classList.remove('hidden');
     if (tab === 'metrics') loadMetrics().catch(() => toast(t('metrics.loadFailed'), 'error'));
+    if (tab === 'accounts') loadAccounts().catch(() => {});
     if (tab === 'live') {
       loadLive();
       startLivePolling();
@@ -3666,7 +3796,13 @@
     wireEvents();
     if (password) tryAutoLogin();
     setInterval(() => {
-      if (!$('mainPage').classList.contains('hidden')) loadStats();
+      if ($('mainPage').classList.contains('hidden')) return;
+      loadStats();
+      // 账号 tab 可见时同步刷新账号卡片，使请求数/429率/冷却状态保持最新。
+      const accountsTab = $('tabAccounts');
+      if (accountsTab && !accountsTab.classList.contains('hidden')) {
+        loadAccounts().catch(() => {});
+      }
     }, 10000);
   }
 

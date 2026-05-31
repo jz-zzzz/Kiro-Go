@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"encoding/json"
+	"kiro-go/logger"
 	"strings"
 	"time"
 
@@ -121,7 +122,12 @@ func OpenAIToKiro(req *OpenAIRequest, thinking bool) *KiroPayload {
 			var toolUses []KiroToolUse
 			for _, tc := range msg.ToolCalls {
 				var input map[string]interface{}
-				json.Unmarshal([]byte(tc.Function.Arguments), &input)
+				if err := json.Unmarshal([]byte(tc.Function.Arguments), &input); err != nil {
+					// Malformed tool-call arguments in the history: log instead of
+					// silently passing an empty object to the upstream, which would
+					// corrupt the conversation context.
+					logger.Warnf("[OpenAI] assistant tool_call %q arguments JSON parse failed: %v", tc.Function.Name, err)
+				}
 				if input == nil {
 					input = make(map[string]interface{})
 				}

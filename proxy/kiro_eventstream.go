@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"kiro-go/logger"
 	"strconv"
 	"strings"
 
@@ -336,7 +337,12 @@ func finishToolUse(state *toolUseState, callback *KiroStreamCallback) {
 	}
 	var input map[string]interface{}
 	if state.InputBuffer.Len() > 0 {
-		json.Unmarshal([]byte(state.InputBuffer.String()), &input)
+		if err := json.Unmarshal([]byte(state.InputBuffer.String()), &input); err != nil {
+			// The upstream sent a tool-input buffer we cannot parse as JSON.
+			// Don't silently drop the arguments to an empty object: log it so
+			// the malformed payload is visible when diagnosing tool calls.
+			logger.Warnf("[KiroAPI] tool %q input JSON parse failed (%d bytes): %v", state.Name, state.InputBuffer.Len(), err)
+		}
 	}
 	if input == nil {
 		input = make(map[string]interface{})

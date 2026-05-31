@@ -92,7 +92,9 @@ func normalizeRoutingConcurrencyConfig(in RoutingConcurrencyConfig) RoutingConcu
 // Init initializes the configuration system with the specified file path.
 // If the file doesn't exist, a default configuration is created.
 func Init(path string) error {
+	cfgLock.Lock()
 	cfgPath = path
+	cfgLock.Unlock()
 	return Load()
 }
 
@@ -184,12 +186,27 @@ func newUUID() string {
 
 // Save persists the current configuration to the JSON file.
 // Uses indented formatting for human readability.
+//
+// The write is atomic (temp file + rename) so a crash or full disk mid-write
+// cannot truncate config.json, which holds every account's credentials.
+//
+// Callers MUST already hold cfgLock (read of cfg and cfgPath below relies on
+// it); see saveLocked for the explicitly-named locked-context alias.
 func Save() error {
 	data, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(cfgPath, data, 0600)
+	tmp := cfgPath + ".tmp"
+	if err := os.WriteFile(tmp, data, 0600); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, cfgPath); err != nil {
+		// Best-effort cleanup of the temp file on rename failure.
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
 }
 
 // GetConfigDir returns the directory containing the config JSON file.

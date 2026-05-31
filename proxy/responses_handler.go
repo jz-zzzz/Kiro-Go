@@ -25,6 +25,8 @@ func (h *Handler) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	logInboundRequestProbe("responses", r, body)
+
 	var req ResponsesRequest
 	if err := json.Unmarshal(body, &req); err != nil {
 		h.sendOpenAIError(w, 400, "invalid_request_error", "Invalid JSON")

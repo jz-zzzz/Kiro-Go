@@ -65,6 +65,8 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	logInboundRequestProbe("openai", r, body)
+
 	var req OpenAIRequest
 	if err := json.Unmarshal(body, &req); err != nil {
 		h.sendOpenAIError(w, 400, "invalid_request_error", "Invalid JSON")

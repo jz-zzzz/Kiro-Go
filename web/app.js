@@ -833,8 +833,33 @@
     setText('liveProcessed', formatNum(Number(c.processedTotal || 0)));
     setText('liveRejected', formatNum(Number(c.rejectedTotal || 0)));
     setText('liveTimeout', formatNum(Number(c.timeoutTotal || 0)));
+    renderLiveSticky(data.sticky);
     renderLiveAccounts(data.perAccount, Number(c.maxConcurrent || 0));
     renderLiveStream(data.recent);
+  }
+  function renderLiveSticky(s) {
+    s = s || {};
+    const rateEl = $('liveStickyRate');
+    if (rateEl) {
+      // Disabled or no traffic yet: show a dash instead of a misleading 0%.
+      const total = Number(s.total || 0);
+      if (s.enabled === false) {
+        rateEl.textContent = '—';
+      } else {
+        rateEl.textContent = total > 0 ? formatNum(Number(s.hitRate || 0)) : '—';
+      }
+    }
+    const sub = $('liveStickyBreakdown');
+    if (sub) {
+      if (s.enabled === false) {
+        sub.textContent = t('live.stickyDisabled');
+      } else {
+        sub.textContent = t('live.stickyBreakdown')
+          .replace('{hit}', formatNum(Number(s.hitTotal || 0)))
+          .replace('{miss}', formatNum(Number(s.missTotal || 0)))
+          .replace('{divert}', formatNum(Number(s.divertTotal || 0)));
+      }
+    }
   }
   function renderLiveAccounts(items, globalMax) {
     const el = $('liveAccounts');

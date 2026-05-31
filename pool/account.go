@@ -85,6 +85,13 @@ type AccountPool struct {
 	routeProcessedTotal uint64 // requests that successfully acquired a route slot
 	routeRejectedTotal  uint64 // requests rejected because the queue was full
 	routeTimeoutTotal   uint64 // requests that timed out while waiting in the queue
+
+	// Sticky (conversation-affinity) outcome counters. Only requests carrying a
+	// non-empty affinity key are counted, so hit+miss+divert == affinity-keyed
+	// successful acquisitions.
+	routeStickyHitTotal    uint64 // had a pin and routed to it (prompt cache reused)
+	routeStickyMissTotal   uint64 // no pin yet: new conversation established one
+	routeStickyDivertTotal uint64 // had a pin but routed elsewhere (busy/unhealthy)
 }
 
 var (
@@ -516,13 +523,16 @@ func (p *AccountPool) evictSoonestStickyLocked() {
 // pinned to affinityKey (if routable), otherwise falls back to weighted
 // round-robin and pins the chosen account. Caller must hold p.mu.
 func (p *AccountPool) getStickyOrNextLocked(model string, excluded map[string]bool, affinityKey string, allowOverUsage bool, now time.Time) *config.Account {
+	hadPin := false
 	if stickyID := p.lookupStickyLocked(affinityKey, now); stickyID != "" {
+		hadPin = true
 		for i := range p.accounts {
 			if p.accounts[i].ID != stickyID {
 				continue
 			}
 			if p.canRouteAccountLocked(&p.accounts[i], model, excluded, allowOverUsage, now, true) {
 				p.setStickyLocked(affinityKey, stickyID, now) // refresh TTL
+				atomic.AddUint64(&p.routeStickyHitTotal, 1)
 				return &p.accounts[i]
 			}
 			break
@@ -531,6 +541,11 @@ func (p *AccountPool) getStickyOrNextLocked(model string, excluded map[string]bo
 	acc := p.getNextLockedExcept(model, excluded)
 	if acc != nil {
 		p.setStickyLocked(affinityKey, acc.ID, now)
+		if hadPin {
+			atomic.AddUint64(&p.routeStickyDivertTotal, 1)
+		} else {
+			atomic.AddUint64(&p.routeStickyMissTotal, 1)
+		}
 	}
 	return acc
 }
@@ -597,6 +612,9 @@ func (p *AccountPool) tryAcquireForModel(model string, excluded map[string]bool,
 			}
 			if acc, considered := tryAccount(&p.accounts[i], true); acc != nil || considered {
 				if acc != nil || !rc.OverflowToOtherAccounts {
+					if acc != nil {
+						atomic.AddUint64(&p.routeStickyHitTotal, 1)
+					}
 					return routingTryResult{account: copyAccount(acc), busy: acc == nil, wait: earliestWait, notify: p.routeNotify}, nil
 				}
 				break
@@ -621,6 +639,15 @@ func (p *AccountPool) tryAcquireForModel(model string, excluded map[string]bool,
 		}
 		seen[acc.ID] = true
 		if selected, _ := tryAccount(acc, canPinHere); selected != nil {
+			if strings.TrimSpace(affinityKey) != "" {
+				if stickyID != "" {
+					// Had a pin but it was busy/unhealthy → routed elsewhere this turn.
+					atomic.AddUint64(&p.routeStickyDivertTotal, 1)
+				} else if rc.StickyAccount {
+					// New conversation established its pin here.
+					atomic.AddUint64(&p.routeStickyMissTotal, 1)
+				}
+			}
 			return routingTryResult{account: copyAccount(selected)}, nil
 		}
 	}
@@ -664,13 +691,16 @@ func (p *AccountPool) RoutingStats() map[string]interface{} {
 		}
 	}
 	return map[string]interface{}{
-		"active":           p.routeGlobalActive,
-		"waiting":          p.routeWaiting,
-		"perAccountActive": perAccount,
-		"enqueuedTotal":    atomic.LoadUint64(&p.routeEnqueuedTotal),
-		"processedTotal":   atomic.LoadUint64(&p.routeProcessedTotal),
-		"rejectedTotal":    atomic.LoadUint64(&p.routeRejectedTotal),
-		"timeoutTotal":     atomic.LoadUint64(&p.routeTimeoutTotal),
+		"active":            p.routeGlobalActive,
+		"waiting":           p.routeWaiting,
+		"perAccountActive":  perAccount,
+		"enqueuedTotal":     atomic.LoadUint64(&p.routeEnqueuedTotal),
+		"processedTotal":    atomic.LoadUint64(&p.routeProcessedTotal),
+		"rejectedTotal":     atomic.LoadUint64(&p.routeRejectedTotal),
+		"timeoutTotal":      atomic.LoadUint64(&p.routeTimeoutTotal),
+		"stickyHitTotal":    atomic.LoadUint64(&p.routeStickyHitTotal),
+		"stickyMissTotal":   atomic.LoadUint64(&p.routeStickyMissTotal),
+		"stickyDivertTotal": atomic.LoadUint64(&p.routeStickyDivertTotal),
 	}
 }
 

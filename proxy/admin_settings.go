@@ -234,11 +234,41 @@ func (h *Handler) apiMetricsLive(w http.ResponseWriter, r *http.Request) {
 		"timeoutTotal":   stats["timeoutTotal"],
 	}
 
+	// Sticky (conversation affinity) outcomes. hitRate is over affinity-keyed
+	// requests only (hit+miss+divert); a "miss" is the unavoidable first turn of
+	// a new conversation, so it is not a failure.
+	stickyHit := toUint64(stats["stickyHitTotal"])
+	stickyMiss := toUint64(stats["stickyMissTotal"])
+	stickyDivert := toUint64(stats["stickyDivertTotal"])
+	stickyTotal := stickyHit + stickyMiss + stickyDivert
+	hitRate := 0.0
+	if stickyTotal > 0 {
+		hitRate = float64(int64(float64(stickyHit)/float64(stickyTotal)*1000+0.5)) / 10 // one decimal %
+	}
+	sticky := map[string]interface{}{
+		"enabled":     rc.StickyAccount,
+		"hitTotal":    stickyHit,
+		"missTotal":   stickyMiss,
+		"divertTotal": stickyDivert,
+		"total":       stickyTotal,
+		"hitRate":     hitRate,
+	}
+
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"concurrency": concurrency,
+		"sticky":      sticky,
 		"perAccount":  perAccount,
 		"recent":      recentLiveRequests(limit),
 	})
+}
+
+// toUint64 coerces the interface{} values from RoutingStats (which holds uint64)
+// to uint64, defaulting to 0.
+func toUint64(v interface{}) uint64 {
+	if n, ok := v.(uint64); ok {
+		return n
+	}
+	return 0
 }
 
 // apiGenerateMachineId 生成新的机器码

@@ -663,3 +663,45 @@ func TestStickyEvictionRespectsCapacity(t *testing.T) {
 		t.Fatal("newly inserted key should be present after eviction")
 	}
 }
+
+// Sticky outcome counters: first turn = miss, subsequent same-key turns = hit;
+// empty affinity key is not counted.
+func TestStickyOutcomeCounters(t *testing.T) {
+	setRoutingConfig(t, config.RoutingConcurrencyConfig{
+		Enabled:       false,
+		StickyAccount: true,
+	})
+	p := newTestPool(config.Account{ID: "a"}, config.Account{ID: "b"})
+
+	// First turn of a new conversation → miss.
+	_, rel, err := p.AcquireForModel(context.Background(), "", nil, "conv-x")
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	rel()
+	// Next two turns → hits.
+	for i := 0; i < 2; i++ {
+		_, rel, err := p.AcquireForModel(context.Background(), "", nil, "conv-x")
+		if err != nil {
+			t.Fatalf("acquire: %v", err)
+		}
+		rel()
+	}
+	// Empty key must not be counted.
+	_, rel, err = p.AcquireForModel(context.Background(), "", nil, "")
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	rel()
+
+	stats := p.RoutingStats()
+	if got := stats["stickyMissTotal"].(uint64); got != 1 {
+		t.Fatalf("stickyMissTotal = %d, want 1", got)
+	}
+	if got := stats["stickyHitTotal"].(uint64); got != 2 {
+		t.Fatalf("stickyHitTotal = %d, want 2", got)
+	}
+	if got := stats["stickyDivertTotal"].(uint64); got != 0 {
+		t.Fatalf("stickyDivertTotal = %d, want 0", got)
+	}
+}

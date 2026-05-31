@@ -3,6 +3,7 @@ package proxy
 import (
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func TestExtractOpenAIMessageTextStructured(t *testing.T) {
@@ -574,5 +575,45 @@ func TestParseModelAndThinkingDoesNotRewriteDatedSnapshotMinor(t *testing.T) {
 	}
 	if strings.Contains(got, ".") {
 		t.Fatalf("dated snapshot must not be rewritten with a dot, got %q", got)
+	}
+}
+
+func TestTruncateRunesDoesNotSplitMultibyte(t *testing.T) {
+	// 5 Chinese characters (3 bytes each in UTF-8) + emoji.
+	s := "你好世界啊🚀"
+	got := truncateRunes(s, 3)
+	if got != "你好世" {
+		t.Fatalf("truncateRunes = %q, want %q", got, "你好世")
+	}
+	if !utf8.ValidString(got) {
+		t.Fatalf("truncateRunes produced invalid UTF-8: %q", got)
+	}
+	// n >= len: unchanged.
+	if got := truncateRunes(s, 100); got != s {
+		t.Fatalf("truncateRunes should return original when n>=len, got %q", got)
+	}
+	// n <= 0: empty.
+	if got := truncateRunes(s, 0); got != "" {
+		t.Fatalf("truncateRunes(0) = %q, want empty", got)
+	}
+}
+
+func TestTruncateToByteLimitAtRune(t *testing.T) {
+	// Each Chinese char is 3 bytes. Limit 7 bytes -> at most 2 full chars (6 bytes),
+	// never a partial 3rd char that would exceed the byte cap or break UTF-8.
+	s := "你好世界"
+	got := truncateToByteLimitAtRune(s, 7)
+	if got != "你好" {
+		t.Fatalf("truncateToByteLimitAtRune = %q, want %q", got, "你好")
+	}
+	if len(got) > 7 {
+		t.Fatalf("result exceeds byte limit: %d bytes", len(got))
+	}
+	if !utf8.ValidString(got) {
+		t.Fatalf("truncateToByteLimitAtRune produced invalid UTF-8: %q", got)
+	}
+	// ASCII within limit: unchanged.
+	if got := truncateToByteLimitAtRune("abc", 64); got != "abc" {
+		t.Fatalf("short ASCII should be unchanged, got %q", got)
 	}
 }

@@ -17,8 +17,8 @@ func convertClaudeTools(tools []ClaudeTool) ([]KiroToolWrapper, map[string]strin
 	nameMap := make(map[string]string)
 	for _, tool := range tools {
 		desc := tool.Description
-		if len(desc) > maxToolDescLen {
-			desc = desc[:maxToolDescLen] + "..."
+		if len([]rune(desc)) > maxToolDescLen {
+			desc = truncateRunes(desc, maxToolDescLen) + "..."
 		}
 		sanitized := shortenToolName(sanitizeToolName(tool.Name))
 		if sanitized != tool.Name {
@@ -498,7 +498,26 @@ func shortenToolName(name string) string {
 			}
 		}
 	}
-	return name[:64]
+	return truncateToByteLimitAtRune(name, 64)
+}
+
+// truncateToByteLimitAtRune truncates s to the largest prefix that fits within
+// maxBytes bytes without splitting a multi-byte UTF-8 character. The 64-byte
+// cap is an upstream hard limit, so we stay within it while avoiding invalid
+// UTF-8 that plain byte slicing (s[:64]) could produce.
+func truncateToByteLimitAtRune(s string, maxBytes int) string {
+	if len(s) <= maxBytes {
+		return s
+	}
+	b := 0
+	for _, r := range s {
+		size := len(string(r))
+		if b+size > maxBytes {
+			break
+		}
+		b += size
+	}
+	return s[:b]
 }
 
 func convertOpenAITools(tools []OpenAITool) []KiroToolWrapper {
@@ -512,8 +531,8 @@ func convertOpenAITools(tools []OpenAITool) []KiroToolWrapper {
 			continue
 		}
 		desc := tool.Function.Description
-		if len(desc) > maxToolDescLen {
-			desc = desc[:maxToolDescLen] + "..."
+		if len([]rune(desc)) > maxToolDescLen {
+			desc = truncateRunes(desc, maxToolDescLen) + "..."
 		}
 		wrapper := KiroToolWrapper{}
 		wrapper.ToolSpecification.Name = shortenToolName(tool.Function.Name)

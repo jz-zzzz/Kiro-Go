@@ -8,6 +8,25 @@ import (
 	"github.com/google/uuid"
 )
 
+// Precompiled regexes used on the request hot path (avoid recompiling per call).
+var (
+	imagePlaceholderPattern = regexp.MustCompile(`\[Image\s+\d+\]`)
+	dataURLPattern          = regexp.MustCompile(`^data:image/([a-zA-Z0-9+.-]+)(;[a-zA-Z0-9=._:+-]+)*;base64,(.+)$`)
+)
+
+// truncateRunes truncates s to at most n runes, never splitting a multi-byte
+// character (which byte slicing s[:n] would do, producing invalid UTF-8).
+func truncateRunes(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n])
+}
+
 func buildToolResultsContinuation(toolResults []KiroToolResult) string {
 	if len(toolResults) == 0 {
 		return minimalFallbackUserContent
@@ -30,10 +49,7 @@ func buildToolResultsContinuation(toolResults []KiroToolResult) string {
 	}
 
 	joined := toolResultsContinuationPrefix + "\n\n" + strings.Join(parts, "\n\n")
-	if len(joined) > 4000 {
-		return joined[:4000]
-	}
-	return joined
+	return truncateRunes(joined, 4000)
 }
 
 func trimLeadingAssistantHistory(history []KiroHistoryMessage) []KiroHistoryMessage {
@@ -74,8 +90,7 @@ func isSyntheticConversationAnchor(anchor string) bool {
 }
 
 func sanitizeImagePlaceholders(text string) string {
-	re := regexp.MustCompile(`\[Image\s+\d+\]`)
-	cleaned := re.ReplaceAllString(text, "")
+	cleaned := imagePlaceholderPattern.ReplaceAllString(text, "")
 	cleaned = strings.Join(strings.Fields(cleaned), " ")
 	return strings.TrimSpace(cleaned)
 }
@@ -93,16 +108,13 @@ func parseDataURL(url string) *KiroImage {
 	if strings.Contains(cleaned, "[Image") {
 		return nil
 	}
-	re := regexp.MustCompile(`^data:image/([a-zA-Z0-9+.-]+)(;[a-zA-Z0-9=._:+-]+)*;base64,(.+)$`)
-	matches := re.FindStringSubmatch(cleaned)
-	if len(matches) == 4 {
-		return parseBase64Image(matches[3], matches[1])
-	}
-	if len(matches) != 3 {
+	// dataURLPattern has 3 capture groups, so a match yields exactly 4 elements
+	// (full match + 3 groups); anything else means no match.
+	matches := dataURLPattern.FindStringSubmatch(cleaned)
+	if len(matches) != 4 {
 		return nil
 	}
-
-	return parseBase64Image(matches[2], matches[1])
+	return parseBase64Image(matches[3], matches[1])
 }
 
 func parseBase64Image(data, format string) *KiroImage {

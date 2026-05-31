@@ -344,13 +344,14 @@ func CallKiroAPI(ctx context.Context, account *config.Account, payload *KiroPayl
 	}
 	setPayloadProfileArnForAccount(payload, account)
 
-	if _, err := json.Marshal(payload); err != nil {
-		return err
-	}
-
-	// Debug: dump full payload for troubleshooting upstream rejections
-	if payloadJSON, err := json.Marshal(payload); err == nil {
-		logger.Debugf("[KiroAPI] Request payload: %s", string(payloadJSON))
+	// Debug: dump full payload for troubleshooting upstream rejections.
+	// Guard on the level so we don't marshal the (potentially large) payload
+	// when debug logging is off. The per-endpoint marshal below also surfaces
+	// any marshal error, so we no longer pre-marshal just to validate.
+	if logger.GetLevel() <= logger.LevelDebug {
+		if payloadJSON, err := json.Marshal(payload); err == nil {
+			logger.Debugf("[KiroAPI] Request payload: %s", string(payloadJSON))
+		}
 	}
 
 	// Wrap OnToolUse to normalize Kiro-generated tool inputs and restore
@@ -394,7 +395,10 @@ func CallKiroAPI(ctx context.Context, account *config.Account, payload *KiroPayl
 		// Update the origin field for the selected endpoint.
 		payload.ConversationState.CurrentMessage.UserInputMessage.Origin = ep.Origin
 
-		reqBody, _ := json.Marshal(payload)
+		reqBody, err := json.Marshal(payload)
+		if err != nil {
+			return err
+		}
 		req, err := http.NewRequestWithContext(ctx, "POST", ep.URL, bytes.NewReader(reqBody))
 		if err != nil {
 			lastErr = err

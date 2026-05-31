@@ -4,7 +4,35 @@ import (
 	"kiro-go/config"
 	"regexp"
 	"strings"
+	"sync"
 )
+
+// filterRegexCache memoizes compiled user-defined filter-rule patterns so we
+// don't recompile the same regex on every request. Keyed by the raw pattern
+// string; a nil value means the pattern failed to compile (cached so we don't
+// retry compilation each time).
+var (
+	filterRegexCache   sync.Map // map[string]*regexp.Regexp
+	filterRegexInvalid sync.Map // map[string]struct{}
+)
+
+// compileFilterRegex returns the compiled regex for pattern, using a cache.
+// Returns nil if the pattern is invalid.
+func compileFilterRegex(pattern string) *regexp.Regexp {
+	if v, ok := filterRegexCache.Load(pattern); ok {
+		return v.(*regexp.Regexp)
+	}
+	if _, bad := filterRegexInvalid.Load(pattern); bad {
+		return nil
+	}
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		filterRegexInvalid.Store(pattern, struct{}{})
+		return nil
+	}
+	filterRegexCache.Store(pattern, re)
+	return re
+}
 
 // applyPromptFilters applies all enabled prompt filter rules to the system prompt.
 // Order: (1) Claude Code detection → full replacement, (2) strip boundary markers,
@@ -47,8 +75,8 @@ func applyPromptFilters(prompt string) string {
 func applyFilterRule(prompt string, rule config.PromptFilterRule) string {
 	switch rule.Type {
 	case "regex":
-		re, err := regexp.Compile(rule.Match)
-		if err != nil {
+		re := compileFilterRegex(rule.Match)
+		if re == nil {
 			return prompt // invalid regex: skip silently
 		}
 		return re.ReplaceAllString(prompt, rule.Replace)

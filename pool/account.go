@@ -41,6 +41,25 @@ type AccountHealthSnapshot struct {
 	ModeBucket   string  `json:"modeBucket,omitempty"`
 }
 
+// stickyEntry maps a conversation affinity key to the account it was pinned to,
+// with an expiry so stale conversations don't keep an account pinned forever and
+// the sticky map cannot grow without bound.
+type stickyEntry struct {
+	accountID string
+	expiresAt time.Time
+}
+
+const (
+	// stickyTTL is how long a conversation stays pinned to an account after its
+	// last request. Aligned with the maximum prompt-cache window (1h) so the pin
+	// outlives the cache it is meant to reuse. Each hit refreshes the expiry.
+	stickyTTL = time.Hour
+	// stickyMaxEntries caps the sticky map size to bound memory under many
+	// distinct conversations; when exceeded the soonest-to-expire entries are
+	// evicted first.
+	stickyMaxEntries = 10000
+)
+
 // AccountPool 账号池
 type AccountPool struct {
 	mu                      sync.RWMutex
@@ -54,7 +73,7 @@ type AccountPool struct {
 	lastErrorAt             map[string]time.Time       // accountID → last error timestamp
 	routeActiveByAccount    map[string]int
 	routeLastStartByAccount map[string]time.Time
-	routeStickyByKey        map[string]string
+	routeStickyByKey        map[string]stickyEntry
 	routeGlobalActive       int
 	routeWaiting            int
 	routeNotify             chan struct{}
@@ -84,7 +103,7 @@ func GetPool() *AccountPool {
 			lastErrorAt:             make(map[string]time.Time),
 			routeActiveByAccount:    make(map[string]int),
 			routeLastStartByAccount: make(map[string]time.Time),
-			routeStickyByKey:        make(map[string]string),
+			routeStickyByKey:        make(map[string]stickyEntry),
 			routeNotify:             make(chan struct{}),
 			autoRestoreRefresh:      true,
 		}
@@ -335,7 +354,21 @@ func (p *AccountPool) AcquireForModel(ctx context.Context, model string, exclude
 	}
 	rc := config.GetRoutingConcurrencyConfig()
 	if !rc.Enabled {
-		acc := p.GetNextForModelExcluding(model, excluded)
+		// Concurrency limiting is off, but conversation affinity still applies so
+		// multi-turn conversations reuse the same account's prompt cache. Falls
+		// back to weighted round-robin when sticky is disabled or the key is empty.
+		var acc *config.Account
+		if rc.StickyAccount && strings.TrimSpace(affinityKey) != "" {
+			p.refreshAutoRestoredAccounts()
+			allowOverUsage := config.GetAllowOverUsage()
+			now := time.Now()
+			p.mu.Lock()
+			p.ensureRuntimeMapsLocked()
+			acc = copyAccount(p.getStickyOrNextLocked(model, excluded, affinityKey, allowOverUsage, now))
+			p.mu.Unlock()
+		} else {
+			acc = p.GetNextForModelExcluding(model, excluded)
+		}
 		if acc == nil {
 			return nil, nil, ErrRoutingUnavailable
 		}
@@ -416,6 +449,92 @@ func (p *AccountPool) AcquireForModel(ctx context.Context, model string, exclude
 	}
 }
 
+// lookupStickyLocked returns the account ID pinned to affinityKey if it exists
+// and has not expired. Expired entries are removed. Caller must hold p.mu.
+func (p *AccountPool) lookupStickyLocked(affinityKey string, now time.Time) string {
+	if strings.TrimSpace(affinityKey) == "" {
+		return ""
+	}
+	entry, ok := p.routeStickyByKey[affinityKey]
+	if !ok {
+		return ""
+	}
+	if !entry.expiresAt.After(now) {
+		delete(p.routeStickyByKey, affinityKey)
+		return ""
+	}
+	return entry.accountID
+}
+
+// setStickyLocked pins affinityKey to accountID with a refreshed TTL, pruning
+// expired entries and evicting the soonest-to-expire entry when over capacity.
+// Caller must hold p.mu.
+func (p *AccountPool) setStickyLocked(affinityKey, accountID string, now time.Time) {
+	if strings.TrimSpace(affinityKey) == "" || accountID == "" {
+		return
+	}
+	// Refreshing an existing key never grows the map, so only prune/evict when
+	// inserting a genuinely new key.
+	if _, exists := p.routeStickyByKey[affinityKey]; !exists {
+		p.pruneStickyLocked(now)
+		if len(p.routeStickyByKey) >= stickyMaxEntries {
+			p.evictSoonestStickyLocked()
+		}
+	}
+	p.routeStickyByKey[affinityKey] = stickyEntry{accountID: accountID, expiresAt: now.Add(stickyTTL)}
+}
+
+// pruneStickyLocked drops all expired sticky entries. Caller must hold p.mu.
+func (p *AccountPool) pruneStickyLocked(now time.Time) {
+	for key, entry := range p.routeStickyByKey {
+		if !entry.expiresAt.After(now) {
+			delete(p.routeStickyByKey, key)
+		}
+	}
+}
+
+// evictSoonestStickyLocked removes the entry with the earliest expiry to keep
+// the map within stickyMaxEntries. Caller must hold p.mu.
+func (p *AccountPool) evictSoonestStickyLocked() {
+	var soonestKey string
+	var soonest time.Time
+	first := true
+	for key, entry := range p.routeStickyByKey {
+		if first || entry.expiresAt.Before(soonest) {
+			soonestKey = key
+			soonest = entry.expiresAt
+			first = false
+		}
+	}
+	if soonestKey != "" {
+		delete(p.routeStickyByKey, soonestKey)
+	}
+}
+
+// getStickyOrNextLocked selects an account honoring conversation affinity even
+// when concurrency limiting is disabled: it prefers the account previously
+// pinned to affinityKey (if routable), otherwise falls back to weighted
+// round-robin and pins the chosen account. Caller must hold p.mu.
+func (p *AccountPool) getStickyOrNextLocked(model string, excluded map[string]bool, affinityKey string, allowOverUsage bool, now time.Time) *config.Account {
+	if stickyID := p.lookupStickyLocked(affinityKey, now); stickyID != "" {
+		for i := range p.accounts {
+			if p.accounts[i].ID != stickyID {
+				continue
+			}
+			if p.canRouteAccountLocked(&p.accounts[i], model, excluded, allowOverUsage, now, true) {
+				p.setStickyLocked(affinityKey, stickyID, now) // refresh TTL
+				return &p.accounts[i]
+			}
+			break
+		}
+	}
+	acc := p.getNextLockedExcept(model, excluded)
+	if acc != nil {
+		p.setStickyLocked(affinityKey, acc.ID, now)
+	}
+	return acc
+}
+
 func (p *AccountPool) tryAcquireForModel(model string, excluded map[string]bool, affinityKey string, rc config.RoutingConcurrencyConfig) (routingTryResult, error) {
 	p.refreshAutoRestoredAccounts()
 	allowOverUsage := config.GetAllowOverUsage()
@@ -433,7 +552,12 @@ func (p *AccountPool) tryAcquireForModel(model string, excluded map[string]bool,
 
 	var earliestWait time.Duration
 	busySeen := false
-	tryAccount := func(acc *config.Account) (*config.Account, bool) {
+	// tryAccount attempts to reserve a slot on acc. isStickyTarget marks the
+	// account currently pinned to affinityKey: only that account (or the first
+	// pin for a new conversation) updates the sticky map. Overflow picks to other
+	// accounts must NOT overwrite the pin, so the conversation returns to its
+	// cache-warm account once it frees up.
+	tryAccount := func(acc *config.Account, isStickyTarget bool) (*config.Account, bool) {
 		if !p.canRouteAccountLocked(acc, model, excluded, allowOverUsage, now, true) {
 			return nil, false
 		}
@@ -456,22 +580,22 @@ func (p *AccountPool) tryAcquireForModel(model string, excluded map[string]bool,
 		p.routeGlobalActive++
 		p.routeActiveByAccount[acc.ID]++
 		p.routeLastStartByAccount[acc.ID] = now
-		if rc.StickyAccount && strings.TrimSpace(affinityKey) != "" {
-			p.routeStickyByKey[affinityKey] = acc.ID
+		if rc.StickyAccount && isStickyTarget {
+			p.setStickyLocked(affinityKey, acc.ID, now)
 		}
 		return acc, true
 	}
 
 	stickyID := ""
-	if rc.StickyAccount && strings.TrimSpace(affinityKey) != "" {
-		stickyID = p.routeStickyByKey[affinityKey]
+	if rc.StickyAccount {
+		stickyID = p.lookupStickyLocked(affinityKey, now)
 	}
 	if stickyID != "" {
 		for i := range p.accounts {
 			if p.accounts[i].ID != stickyID {
 				continue
 			}
-			if acc, considered := tryAccount(&p.accounts[i]); acc != nil || considered {
+			if acc, considered := tryAccount(&p.accounts[i], true); acc != nil || considered {
 				if acc != nil || !rc.OverflowToOtherAccounts {
 					return routingTryResult{account: copyAccount(acc), busy: acc == nil, wait: earliestWait, notify: p.routeNotify}, nil
 				}
@@ -484,6 +608,9 @@ func (p *AccountPool) tryAcquireForModel(model string, excluded map[string]bool,
 		}
 	}
 
+	// New conversation (no existing pin) may establish one; overflow from an
+	// existing pin must not, so it stays bound to the cache-warm account.
+	canPinHere := rc.StickyAccount && stickyID == ""
 	n := len(p.accounts)
 	seen := make(map[string]bool)
 	for i := 0; i < n; i++ {
@@ -493,7 +620,7 @@ func (p *AccountPool) tryAcquireForModel(model string, excluded map[string]bool,
 			continue
 		}
 		seen[acc.ID] = true
-		if selected, _ := tryAccount(acc); selected != nil {
+		if selected, _ := tryAccount(acc, canPinHere); selected != nil {
 			return routingTryResult{account: copyAccount(selected)}, nil
 		}
 	}
@@ -611,7 +738,7 @@ func (p *AccountPool) ensureRuntimeMapsLocked() {
 		p.routeLastStartByAccount = make(map[string]time.Time)
 	}
 	if p.routeStickyByKey == nil {
-		p.routeStickyByKey = make(map[string]string)
+		p.routeStickyByKey = make(map[string]stickyEntry)
 	}
 	if p.routeNotify == nil {
 		p.routeNotify = make(chan struct{})

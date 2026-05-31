@@ -497,3 +497,169 @@ func TestHealthSnapshotsKeepRefreshableExpiredAccountsRoutable(t *testing.T) {
 		t.Fatalf("expected expired account without refresh token to be non-routable")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Conversation affinity (sticky routing)
+// ---------------------------------------------------------------------------
+
+func setRoutingConfig(t *testing.T, rc config.RoutingConcurrencyConfig) {
+	t.Helper()
+	cfgFile := filepath.Join(t.TempDir(), "config.json")
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	if err := config.UpdateRoutingConcurrencyConfig(rc); err != nil {
+		t.Fatalf("UpdateRoutingConcurrencyConfig: %v", err)
+	}
+}
+
+// With concurrency limiting disabled, the same affinity key must still pin to
+// one account across turns (prompt-cache reuse), instead of round-robin.
+func TestAcquireStickyDisabledConcurrencyPinsSameAccount(t *testing.T) {
+	setRoutingConfig(t, config.RoutingConcurrencyConfig{
+		Enabled:       false,
+		StickyAccount: true,
+	})
+	p := newTestPool(config.Account{ID: "a"}, config.Account{ID: "b"}, config.Account{ID: "c"})
+
+	first, rel, err := p.AcquireForModel(context.Background(), "", nil, "conv-1")
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	rel()
+	for i := 0; i < 10; i++ {
+		acc, rel, err := p.AcquireForModel(context.Background(), "", nil, "conv-1")
+		if err != nil {
+			t.Fatalf("acquire %d: %v", i, err)
+		}
+		rel()
+		if acc.ID != first.ID {
+			t.Fatalf("turn %d routed to %q, expected sticky %q", i, acc.ID, first.ID)
+		}
+	}
+}
+
+// Empty affinity key must fall back to round-robin (no pinning), so single-shot
+// requests still spread across accounts.
+func TestAcquireEmptyAffinityRoundRobins(t *testing.T) {
+	setRoutingConfig(t, config.RoutingConcurrencyConfig{
+		Enabled:       false,
+		StickyAccount: true,
+	})
+	p := newTestPool(config.Account{ID: "a"}, config.Account{ID: "b"})
+	seen := map[string]bool{}
+	for i := 0; i < 6; i++ {
+		acc, rel, err := p.AcquireForModel(context.Background(), "", nil, "")
+		if err != nil {
+			t.Fatalf("acquire %d: %v", i, err)
+		}
+		rel()
+		seen[acc.ID] = true
+	}
+	if len(seen) < 2 {
+		t.Fatalf("empty affinity should round-robin across accounts, only saw %v", seen)
+	}
+}
+
+// Different conversations should be distributable to different accounts.
+func TestAcquireDifferentAffinityCanUseDifferentAccounts(t *testing.T) {
+	setRoutingConfig(t, config.RoutingConcurrencyConfig{
+		Enabled:       false,
+		StickyAccount: true,
+	})
+	p := newTestPool(config.Account{ID: "a"}, config.Account{ID: "b"})
+	seen := map[string]bool{}
+	for i := 0; i < 8; i++ {
+		key := "conv-" + string(rune('A'+i))
+		acc, rel, err := p.AcquireForModel(context.Background(), "", nil, key)
+		if err != nil {
+			t.Fatalf("acquire %s: %v", key, err)
+		}
+		rel()
+		seen[acc.ID] = true
+	}
+	if len(seen) < 2 {
+		t.Fatalf("distinct conversations should spread across accounts, only saw %v", seen)
+	}
+}
+
+// When concurrency limiting is on and the sticky account is busy, the request
+// overflows to another account, but the pin must NOT move: once the original
+// account frees up the conversation returns to it (cache-warm).
+func TestAcquireStickyOverflowDoesNotMovePin(t *testing.T) {
+	setRoutingConfig(t, config.RoutingConcurrencyConfig{
+		Enabled:                 true,
+		GlobalQueueSize:         0,
+		GlobalQueueTimeoutMs:    50,
+		PerAccountMaxConcurrent: 1,
+		StickyAccount:           true,
+		OverflowToOtherAccounts: true,
+	})
+	p := newTestPool(config.Account{ID: "a"}, config.Account{ID: "b"})
+
+	// Establish the pin for conv-1.
+	first, relFirst, err := p.AcquireForModel(context.Background(), "", nil, "conv-1")
+	if err != nil {
+		t.Fatalf("first acquire: %v", err)
+	}
+	// Second concurrent turn of conv-1: sticky account is busy → overflow.
+	second, relSecond, err := p.AcquireForModel(context.Background(), "", nil, "conv-1")
+	if err != nil {
+		relFirst()
+		t.Fatalf("overflow acquire: %v", err)
+	}
+	if second.ID == first.ID {
+		relFirst()
+		relSecond()
+		t.Fatalf("expected overflow to a different account")
+	}
+	relFirst()
+	relSecond()
+
+	// Next turn of conv-1 (nothing busy) must return to the original pinned account.
+	third, relThird, err := p.AcquireForModel(context.Background(), "", nil, "conv-1")
+	if err != nil {
+		t.Fatalf("third acquire: %v", err)
+	}
+	defer relThird()
+	if third.ID != first.ID {
+		t.Fatalf("pin moved after overflow: got %q, expected %q", third.ID, first.ID)
+	}
+}
+
+func TestStickyEntryExpires(t *testing.T) {
+	p := newTestPool(config.Account{ID: "a"})
+	p.ensureRuntimeMapsLocked()
+	now := time.Now()
+	p.setStickyLocked("conv-1", "a", now)
+	if got := p.lookupStickyLocked("conv-1", now.Add(stickyTTL-time.Second)); got != "a" {
+		t.Fatalf("expected live pin, got %q", got)
+	}
+	if got := p.lookupStickyLocked("conv-1", now.Add(stickyTTL+time.Second)); got != "" {
+		t.Fatalf("expected expired pin to be empty, got %q", got)
+	}
+	if _, ok := p.routeStickyByKey["conv-1"]; ok {
+		t.Fatal("expired entry should have been deleted on lookup")
+	}
+}
+
+func TestStickyEvictionRespectsCapacity(t *testing.T) {
+	p := newTestPool(config.Account{ID: "a"})
+	p.ensureRuntimeMapsLocked()
+	base := time.Now()
+	// Fill to capacity with staggered expiries (key i expires soonest for small i).
+	for i := 0; i < stickyMaxEntries; i++ {
+		p.routeStickyByKey[string(rune(i))+"-k"] = stickyEntry{
+			accountID: "a",
+			expiresAt: base.Add(time.Duration(i) * time.Millisecond),
+		}
+	}
+	// Inserting a new key beyond capacity must evict, keeping size bounded.
+	p.setStickyLocked("brand-new", "a", base.Add(time.Hour))
+	if len(p.routeStickyByKey) > stickyMaxEntries {
+		t.Fatalf("sticky map exceeded capacity: %d > %d", len(p.routeStickyByKey), stickyMaxEntries)
+	}
+	if _, ok := p.routeStickyByKey["brand-new"]; !ok {
+		t.Fatal("newly inserted key should be present after eviction")
+	}
+}

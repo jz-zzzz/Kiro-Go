@@ -112,3 +112,16 @@ func apiKeyIDFromContext(ctx context.Context) string {
 	}
 	return ""
 }
+
+// apiKeyForbidsSyncRequests reports whether the API key identified by apiKeyID
+// is configured stream-only (StreamOnly=true), in which case non-streaming
+// (synchronous) requests must be rejected. An empty apiKeyID (auth disabled, or
+// the legacy single-key path that carries no per-key entry) cannot be resolved
+// to an entry and is therefore allowed: the restriction is a per-key property.
+func apiKeyForbidsSyncRequests(apiKeyID string) bool {
+	if apiKeyID == "" {
+		return false
+	}
+	entry := config.GetApiKeyEntry(apiKeyID)
+	return entry != nil && entry.StreamOnly
+}

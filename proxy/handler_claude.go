@@ -125,6 +125,10 @@ func (h *Handler) handleCountTokens(w http.ResponseWriter, r *http.Request) {
 
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
+		if maxBytesExceeded(err) {
+			h.sendClaudeError(w, 413, "invalid_request_error", "Request body too large")
+			return
+		}
 		h.sendClaudeError(w, 400, "invalid_request_error", "Failed to read request body")
 		return
 	}
@@ -168,6 +172,10 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	// 读取请求
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
+		if maxBytesExceeded(err) {
+			h.sendClaudeError(w, 413, "invalid_request_error", "Request body too large")
+			return
+		}
 		h.sendClaudeError(w, 400, "invalid_request_error", "Failed to read request body")
 		return
 	}
@@ -209,6 +217,10 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 	if req.Stream {
 		h.handleClaudeStream(r.Context(), w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID)
 	} else {
+		if apiKeyForbidsSyncRequests(apiKeyID) {
+			h.sendClaudeError(w, 403, "permission_error", "This API key only permits streaming requests; set \"stream\": true.")
+			return
+		}
 		h.handleClaudeNonStream(r.Context(), w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID)
 	}
 }
@@ -622,6 +634,9 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
 			if !messageStarted {
+				if shouldBackoffBeforeRetry(err) {
+					time.Sleep(retryBackoffAfterRateLimit())
+				}
 				continue
 			}
 			h.recordFailure()
@@ -784,6 +799,9 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 			lastAccount = account
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
+			if shouldBackoffBeforeRetry(err) {
+				time.Sleep(retryBackoffAfterRateLimit())
+			}
 			continue
 		}
 

@@ -101,6 +101,13 @@ type ApiKeyEntry struct {
 	CreatedAt  int64  `json:"createdAt"`          // Creation timestamp (Unix seconds)
 	LastUsedAt int64  `json:"lastUsedAt,omitempty"`
 
+	// StreamOnly, when true, rejects non-streaming (synchronous) requests made
+	// with this key. Synchronous requests buffer the entire upstream response in
+	// memory (via strings.Builder) before replying, so under load they are the
+	// dominant memory pressure; restricting selected keys to streaming-only keeps
+	// per-request memory bounded. Streaming requests are unaffected.
+	StreamOnly bool `json:"streamOnly,omitempty"`
+
 	// Limits (0 = unlimited)
 	TokenLimit  int64   `json:"tokenLimit,omitempty"`
 	CreditLimit float64 `json:"creditLimit,omitempty"`
@@ -161,6 +168,13 @@ type Config struct {
 
 	// RoutingConcurrency controls sticky routing, per-account limits and global queueing.
 	RoutingConcurrency RoutingConcurrencyConfig `json:"routingConcurrency,omitempty"`
+
+	// MaxRequestBodyMB caps inbound request body size (in MiB) on the public
+	// inference endpoints (messages / count_tokens / chat completions / responses).
+	// Bodies are read with io.ReadAll, so an unbounded size lets a single oversized
+	// or malicious request balloon memory; exceeding the cap returns HTTP 413.
+	// 0 or negative means use the built-in default (see GetMaxRequestBodyBytes).
+	MaxRequestBodyMB int `json:"maxRequestBodyMB,omitempty"`
 
 	// Proxy configuration: optional outbound proxy for Kiro API requests
 	// Format: "socks5://host:port", "socks5://user:pass@host:port",

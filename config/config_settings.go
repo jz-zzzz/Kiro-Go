@@ -315,6 +315,23 @@ func GetRoutingConcurrencyConfig() RoutingConcurrencyConfig {
 	return normalizeRoutingConcurrencyConfig(cfg.RoutingConcurrency)
 }
 
+// defaultMaxRequestBodyBytes bounds inbound request bodies on the public
+// inference endpoints. 32 MiB mirrors Anthropic's documented request limit:
+// large enough for long multimodal contexts, small enough to stop a single
+// oversized/malicious body from ballooning process memory via io.ReadAll.
+const defaultMaxRequestBodyBytes int64 = 32 << 20
+
+// GetMaxRequestBodyBytes returns the configured inbound body cap in bytes,
+// falling back to defaultMaxRequestBodyBytes when unset or non-positive.
+func GetMaxRequestBodyBytes() int64 {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil || cfg.MaxRequestBodyMB <= 0 {
+		return defaultMaxRequestBodyBytes
+	}
+	return int64(cfg.MaxRequestBodyMB) << 20
+}
+
 func UpdateRoutingConcurrencyConfig(rc RoutingConcurrencyConfig) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()

@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"encoding/json"
+	"errors"
 	"kiro-go/auth"
 	"kiro-go/config"
 	"kiro-go/logger"
@@ -33,7 +34,23 @@ type Handler struct {
 	modelsCacheMu   sync.RWMutex
 	modelsCacheTime int64
 	promptCache     *promptCacheTracker
-	tokenRefreshMu  sync.Mutex
+	// tokenRefreshLocks 为每个账号维护一把独立的刷新锁(accountID → *sync.Mutex),
+	// 通过 accountRefreshLock 惰性创建。相比单把全局锁,不同账号的 token 刷新
+	// (含 OIDC 网络往返 + 写盘)不再互相阻塞;同账号仍互斥,配合 ensureValidToken
+	// 内的 double-check 实现"同账号刷新去重"。
+	tokenRefreshLocks sync.Map
+	// kamImports 跟踪批量(kam)导入任务的进度,供前端轮询查询。
+	kamImports *kamImportManager
+}
+
+// accountRefreshLock 返回该账号专属的 token 刷新锁,惰性创建。
+// sync.Map.LoadOrStore 保证并发下同一 accountID 只会对应同一把锁。
+func (h *Handler) accountRefreshLock(accountID string) *sync.Mutex {
+	if v, ok := h.tokenRefreshLocks.Load(accountID); ok {
+		return v.(*sync.Mutex)
+	}
+	actual, _ := h.tokenRefreshLocks.LoadOrStore(accountID, &sync.Mutex{})
+	return actual.(*sync.Mutex)
 }
 
 const (
@@ -58,6 +75,7 @@ func NewHandler() *Handler {
 		stopRefresh:     make(chan struct{}),
 		stopStatsSaver:  make(chan struct{}),
 		promptCache:     newPromptCacheTracker(defaultPromptCacheTTL),
+		kamImports:      newKamImportManager(),
 	}
 	// 启动后台刷新
 	go h.backgroundRefresh()
@@ -90,52 +108,103 @@ func (h *Handler) backgroundRefresh() {
 	}
 }
 
-// refreshAllAccounts 刷新所有账户信息
+// backgroundRefreshConcurrency bounds how many accounts are refreshed in
+// parallel during a periodic sweep. Refresh is network-bound (token exchange +
+// getUsageLimits per account), so a serial sweep of a large pool (1000+
+// accounts) could take longer than the refresh interval itself, starving newly
+// imported accounts of their first activation. Bounded parallelism keeps a full
+// sweep quick without hammering upstream hard enough to trigger IP-level rate
+// limiting.
+const backgroundRefreshConcurrency = 10
+
+// refreshAllAccounts 刷新所有账户信息（受控并发）
 func (h *Handler) refreshAllAccounts() {
 	accounts := config.GetAccounts()
+
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, backgroundRefreshConcurrency)
 	for i := range accounts {
 		account := &accounts[i]
-		if !account.Enabled || account.AccessToken == "" {
+		// Skip only accounts that can never be refreshed: disabled, or holding
+		// no credential at all. An empty AccessToken alone is NOT a skip reason —
+		// a bulk-imported account may arrive with only a RefreshToken and must be
+		// activated by exchanging it here (the previous guard skipped these
+		// forever, leaving them permanently unusable).
+		if !account.Enabled {
+			continue
+		}
+		if account.AccessToken == "" && account.RefreshToken == "" {
 			continue
 		}
 
-		// 检查 token 是否需要刷新
-		if account.ExpiresAt > 0 && time.Now().Unix() > account.ExpiresAt-tokenRefreshSkewSeconds {
-			newAccessToken, newRefreshToken, newExpiresAt, profileArn, err := auth.RefreshToken(account)
-			if err != nil {
-				logger.Warnf("[BackgroundRefresh] Token refresh failed for %s: %v", account.Email, err)
-				h.handleAccountFailure(account, err)
-				continue
-			}
-			account.AccessToken = newAccessToken
-			if newRefreshToken != "" {
-				account.RefreshToken = newRefreshToken
-			}
-			account.ExpiresAt = newExpiresAt
-			config.UpdateAccountToken(account.ID, newAccessToken, newRefreshToken, newExpiresAt)
-			h.pool.UpdateToken(account.ID, newAccessToken, newRefreshToken, newExpiresAt)
-			if profileArn != "" {
-				account.ProfileArn = profileArn
-				config.UpdateAccountProfileArn(account.ID, profileArn)
-			}
-		}
-
-		// 刷新账户信息
-		info, err := RefreshAccountInfo(account)
-		if err != nil {
-			logger.Warnf("[BackgroundRefresh] Failed to refresh %s: %v", account.Email, err)
-			continue
-		}
-
-		config.UpdateAccountInfo(account.ID, *info)
-		h.refreshAccountOverageIfExceeded(account, info)
-		logger.Infof("[BackgroundRefresh] Refreshed %s: %s %.1f/%.1f", account.Email, info.SubscriptionType, info.UsageCurrent, info.UsageLimit)
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(account *config.Account) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			h.refreshOneAccount(account)
+		}(account)
 	}
+	wg.Wait()
 	h.pool.Reload()
 }
 
+// refreshOneAccount refreshes a single account's token (when due or missing) and
+// then its usage/subscription info. Safe to run concurrently with other accounts:
+// it only mutates its own *account (a distinct slice element) and the config/pool
+// helpers it calls lock internally.
+func (h *Handler) refreshOneAccount(account *config.Account) {
+	// Refresh the token when it is due to expire OR entirely missing. The
+	// missing case activates imported accounts that arrived with only a refresh
+	// token.
+	needsToken := account.AccessToken == "" ||
+		(account.ExpiresAt > 0 && time.Now().Unix() > account.ExpiresAt-tokenRefreshSkewSeconds)
+	if needsToken {
+		newAccessToken, newRefreshToken, newExpiresAt, profileArn, err := auth.RefreshToken(account)
+		if err != nil {
+			logger.Warnf("[BackgroundRefresh] Token refresh failed for %s: %v", account.Email, err)
+			h.handleAccountFailure(account, err)
+			return
+		}
+		account.AccessToken = newAccessToken
+		if newRefreshToken != "" {
+			account.RefreshToken = newRefreshToken
+		}
+		account.ExpiresAt = newExpiresAt
+		config.UpdateAccountToken(account.ID, newAccessToken, newRefreshToken, newExpiresAt)
+		h.pool.UpdateToken(account.ID, newAccessToken, newRefreshToken, newExpiresAt)
+		if profileArn != "" {
+			account.ProfileArn = profileArn
+			config.UpdateAccountProfileArn(account.ID, profileArn)
+		}
+	}
+
+	// 刷新账户信息
+	info, err := RefreshAccountInfo(account)
+	if err != nil {
+		logger.Warnf("[BackgroundRefresh] Failed to refresh %s: %v", account.Email, err)
+		return
+	}
+
+	config.UpdateAccountInfo(account.ID, *info)
+	h.refreshAccountOverageIfExceeded(account, info)
+	logger.Infof("[BackgroundRefresh] Refreshed %s: %s %.1f/%.1f", account.Email, info.SubscriptionType, info.UsageCurrent, info.UsageLimit)
+}
+
 func (h *Handler) refreshAccountOverageIfExceeded(account *config.Account, info *config.AccountInfo) {
-	if account == nil || info == nil || info.UsageLimit <= 0 || info.UsageCurrent <= info.UsageLimit {
+	if account == nil || info == nil {
+		return
+	}
+	// Usage is back within (or never exceeded) the subscription quota. Overage
+	// points are zero by definition in that case, so clear any stale value left
+	// over from a previous billing period instead of letting it linger (the bug
+	// where a reset quota still showed "206 / 10,000" overage points). No extra
+	// upstream call is needed — within-quota implies zero overage. The cap/rate
+	// billing config and the OverageStatus switch are preserved.
+	if info.UsageLimit <= 0 || info.UsageCurrent <= info.UsageLimit {
+		if clearErr := config.ClearAccountCurrentOverages(account.ID, time.Now().Unix()); clearErr != nil {
+			logger.Warnf("[Overage] failed to clear stale overage points for %s: %v", account.Email, clearErr)
+		}
 		return
 	}
 	snap, err := FetchOverageStatus(account)
@@ -215,25 +284,25 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if ar == nil {
 			return
 		}
-		h.handleClaudeMessages(w, ar)
+		h.handleClaudeMessages(w, limitRequestBody(w, ar))
 	case path == "/v1/messages/count_tokens" || path == "/messages/count_tokens":
 		ar := h.authenticateForClaude(w, r)
 		if ar == nil {
 			return
 		}
-		h.handleCountTokens(w, ar)
+		h.handleCountTokens(w, limitRequestBody(w, ar))
 	case path == "/v1/chat/completions" || path == "/chat/completions":
 		ar := h.authenticateForOpenAI(w, r)
 		if ar == nil {
 			return
 		}
-		h.handleOpenAIChat(w, ar)
+		h.handleOpenAIChat(w, limitRequestBody(w, ar))
 	case path == "/v1/responses" || path == "/responses":
 		ar := h.authenticateForOpenAI(w, r)
 		if ar == nil {
 			return
 		}
-		h.handleOpenAIResponses(w, ar)
+		h.handleOpenAIResponses(w, limitRequestBody(w, ar))
 	case path == "/v1/models" || path == "/models":
 		h.handleModels(w, r)
 	case path == "/api/event_logging/batch":
@@ -266,6 +335,29 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "Not Found", 404)
 	}
+}
+
+// limitRequestBody wraps the request body with http.MaxBytesReader so an
+// oversized (or malicious) inbound request cannot balloon memory: the public
+// inference handlers buffer the whole body with io.ReadAll, so without a cap a
+// single huge POST would be fully read into RAM (and, multiplied by concurrent
+// requests, exhaust it). Reading past the cap makes the subsequent ReadAll fail
+// with *http.MaxBytesError, which the handlers translate into HTTP 413.
+// The cap is configurable via MaxRequestBodyMB (see config.GetMaxRequestBodyBytes).
+func limitRequestBody(w http.ResponseWriter, r *http.Request) *http.Request {
+	if r == nil || r.Body == nil {
+		return r
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, config.GetMaxRequestBodyBytes())
+	return r
+}
+
+// maxBytesExceeded reports whether err stems from the request body exceeding
+// the limit installed by limitRequestBody, so handlers can return 413 instead
+// of a generic 400.
+func maxBytesExceeded(err error) bool {
+	var mbe *http.MaxBytesError
+	return errors.As(err, &mbe)
 }
 
 // handleHealth 健康检查（不暴露统计数据）

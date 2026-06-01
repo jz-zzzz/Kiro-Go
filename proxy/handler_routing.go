@@ -81,8 +81,9 @@ func (h *Handler) ensureValidToken(account *config.Account) error {
 		return nil
 	}
 
-	h.tokenRefreshMu.Lock()
-	defer h.tokenRefreshMu.Unlock()
+	mu := h.accountRefreshLock(account.ID)
+	mu.Lock()
+	defer mu.Unlock()
 
 	// Another concurrent request may have refreshed this account while we waited.
 	if latest := h.pool.GetByID(account.ID); latest != nil {

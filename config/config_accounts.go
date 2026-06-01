@@ -67,6 +67,73 @@ func AddAccount(account Account) error {
 	return Save()
 }
 
+// AddAccounts appends multiple accounts in a single locked pass and persists
+// with exactly one Save(), avoiding the O(n²) write amplification that calling
+// AddAccount in a loop would cause (each AddAccount re-serializes the entire
+// config.json). Accounts whose RefreshToken already exists (against the current
+// config or earlier entries in the same batch) are skipped to keep bulk imports
+// idempotent across retries/re-pastes. Entries with an empty RefreshToken are
+// also skipped — there is no stable identity to dedup on and they cannot be
+// activated later. Returns how many were added and how many were skipped.
+//
+// Save() is only invoked when at least one account is actually added, so a
+// fully-duplicate batch does not churn the config file.
+func AddAccounts(accounts []Account) (added int, skipped int, err error) {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+
+	// Seed the seen-set with refresh tokens already persisted so the batch
+	// dedups against existing accounts, not just within itself.
+	seen := make(map[string]struct{}, len(cfg.Accounts)+len(accounts))
+	for i := range cfg.Accounts {
+		if rt := cfg.Accounts[i].RefreshToken; rt != "" {
+			seen[rt] = struct{}{}
+		}
+	}
+
+	for _, a := range accounts {
+		if a.RefreshToken == "" {
+			skipped++
+			continue
+		}
+		if _, dup := seen[a.RefreshToken]; dup {
+			skipped++
+			continue
+		}
+		seen[a.RefreshToken] = struct{}{}
+		cfg.Accounts = append(cfg.Accounts, a)
+		added++
+	}
+
+	if added == 0 {
+		return 0, skipped, nil
+	}
+	if err := Save(); err != nil {
+		// Roll back the in-memory appends so a failed persist does not leave
+		// the running pool out of sync with what is on disk.
+		cfg.Accounts = cfg.Accounts[:len(cfg.Accounts)-added]
+		return 0, skipped, err
+	}
+	return added, skipped, nil
+}
+
+// RefreshTokenExists reports whether any account already holds the given refresh
+// token. Used by bulk import to dedup candidates before spending an upstream
+// token-exchange round-trip on a duplicate.
+func RefreshTokenExists(refreshToken string) bool {
+	if refreshToken == "" {
+		return false
+	}
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	for i := range cfg.Accounts {
+		if cfg.Accounts[i].RefreshToken == refreshToken {
+			return true
+		}
+	}
+	return false
+}
+
 func UpdateAccount(id string, account Account) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()
@@ -95,6 +162,31 @@ func UpdateAccountOverageStatus(id, status, capability string, cap, rate, curren
 			cfg.Accounts[i].OverageCap = cap
 			cfg.Accounts[i].OverageRate = rate
 			cfg.Accounts[i].CurrentOverages = current
+			if checkedAt > 0 {
+				cfg.Accounts[i].OverageCheckedAt = checkedAt
+			}
+			return Save()
+		}
+	}
+	return nil
+}
+
+// ClearAccountCurrentOverages zeroes the cached CurrentOverages for an account
+// while preserving the OverageStatus switch and the cap/rate billing config.
+// Called when upstream usage has fallen back within the subscription quota
+// (e.g. after a billing-period reset): overage points are zero by definition
+// when usage is within quota, so stale points from a previous period must not
+// linger in the UI/scheduler. Returns without writing if already zero, so the
+// periodic refresh loop does not churn the config file every cycle.
+func ClearAccountCurrentOverages(id string, checkedAt int64) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	for i, a := range cfg.Accounts {
+		if a.ID == id {
+			if cfg.Accounts[i].CurrentOverages == 0 {
+				return nil
+			}
+			cfg.Accounts[i].CurrentOverages = 0
 			if checkedAt > 0 {
 				cfg.Accounts[i].OverageCheckedAt = checkedAt
 			}

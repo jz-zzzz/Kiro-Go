@@ -61,6 +61,10 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
+		if maxBytesExceeded(err) {
+			h.sendOpenAIError(w, 413, "invalid_request_error", "Request body too large")
+			return
+		}
 		h.sendOpenAIError(w, 400, "invalid_request_error", "Failed to read request body")
 		return
 	}
@@ -89,6 +93,10 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	if req.Stream {
 		h.handleOpenAIStream(r.Context(), w, kiroPayload, req.Model, thinking, estimatedInputTokens, apiKeyID)
 	} else {
+		if apiKeyForbidsSyncRequests(apiKeyID) {
+			h.sendOpenAIError(w, 403, "permission_error", "This API key only permits streaming requests; set \"stream\": true.")
+			return
+		}
 		h.handleOpenAINonStream(r.Context(), w, kiroPayload, req.Model, thinking, estimatedInputTokens, apiKeyID)
 	}
 }
@@ -441,6 +449,9 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
 			if !responseStarted {
+				if shouldBackoffBeforeRetry(err) {
+					time.Sleep(retryBackoffAfterRateLimit())
+				}
 				continue
 			}
 			h.recordFailure()
@@ -610,6 +621,9 @@ func (h *Handler) handleOpenAINonStream(ctx context.Context, w http.ResponseWrit
 			lastAccount = account
 			excluded[account.ID] = true
 			h.handleAccountFailure(account, err)
+			if shouldBackoffBeforeRetry(err) {
+				time.Sleep(retryBackoffAfterRateLimit())
+			}
 			continue
 		}
 

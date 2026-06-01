@@ -3,11 +3,40 @@ package proxy
 import (
 	"kiro-go/config"
 	"kiro-go/logger"
+	"math/rand"
 	"strings"
 	"time"
 )
 
-const maxAccountRetryAttempts = 3
+// maxAccountRetryAttempts controls how many different accounts the proxy will
+// try before giving up and returning an error to the calling client. A value of
+// 7 with a 1–2 s backoff between rate-limit failures gives larger pools (1000+
+// accounts) enough runway to rotate past a cluster of simultaneously throttled
+// accounts, while still failing fast when the pool is genuinely drained.
+const maxAccountRetryAttempts = 7
+
+// retryBackoffAfterRateLimit returns a short randomized sleep duration to insert
+// between retries after the previous attempt hit a rate-limit (429) error. The
+// jitter spreads concurrent retries so they don't re-synchronize on the upstream.
+func retryBackoffAfterRateLimit() time.Duration {
+	// 1 s base + 0–1 s jitter
+	return time.Duration(1000+rand.Intn(1000)) * time.Millisecond
+}
+
+// shouldBackoffBeforeRetry reports whether err indicates a rate-limit condition
+// that warrants a short delay before the next account retry, reducing the chance
+// that the next account immediately triggers the same IP-level throttle.
+func shouldBackoffBeforeRetry(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "429") ||
+		strings.Contains(msg, "rate_limit") ||
+		strings.Contains(msg, "too many requests") ||
+		strings.Contains(msg, "suspicious activity") ||
+		strings.Contains(msg, "temporary limits")
+}
 
 func isSuspicious429ErrorMessage(msg string) bool {
 	return strings.Contains(strings.ToLower(msg), "429") && classifyKiro429Body(msg) == "suspicious_temporary_limits"

@@ -13,6 +13,7 @@ type apiKeyView struct {
 	Name          string  `json:"name,omitempty"`
 	KeyMasked     string  `json:"keyMasked"`
 	Enabled       bool    `json:"enabled"`
+	StreamOnly    bool    `json:"streamOnly,omitempty"`
 	Migrated      bool    `json:"migrated,omitempty"`
 	CreatedAt     int64   `json:"createdAt"`
 	LastUsedAt    int64   `json:"lastUsedAt,omitempty"`
@@ -29,6 +30,7 @@ func toApiKeyView(e config.ApiKeyEntry) apiKeyView {
 		Name:          e.Name,
 		KeyMasked:     config.MaskApiKey(e.Key),
 		Enabled:       e.Enabled,
+		StreamOnly:    e.StreamOnly,
 		Migrated:      e.Migrated,
 		CreatedAt:     e.CreatedAt,
 		LastUsedAt:    e.LastUsedAt,
@@ -63,6 +65,7 @@ type apiKeyCreateRequest struct {
 	Name        string  `json:"name,omitempty"`
 	Key         string  `json:"key,omitempty"`
 	Enabled     *bool   `json:"enabled,omitempty"`
+	StreamOnly  *bool   `json:"streamOnly,omitempty"`
 	TokenLimit  int64   `json:"tokenLimit,omitempty"`
 	CreditLimit float64 `json:"creditLimit,omitempty"`
 }
@@ -80,6 +83,11 @@ func (h *Handler) apiCreateApiKey(w http.ResponseWriter, r *http.Request) {
 		enabled = *req.Enabled
 	}
 
+	streamOnly := false
+	if req.StreamOnly != nil {
+		streamOnly = *req.StreamOnly
+	}
+
 	keyValue := req.Key
 	if keyValue == "" {
 		keyValue = config.GenerateApiKeyValue()
@@ -89,6 +97,7 @@ func (h *Handler) apiCreateApiKey(w http.ResponseWriter, r *http.Request) {
 		Name:        req.Name,
 		Key:         keyValue,
 		Enabled:     enabled,
+		StreamOnly:  streamOnly,
 		TokenLimit:  req.TokenLimit,
 		CreditLimit: req.CreditLimit,
 	})
@@ -111,6 +120,7 @@ type apiKeyUpdateRequest struct {
 	Name        *string  `json:"name,omitempty"`
 	Key         *string  `json:"key,omitempty"`
 	Enabled     *bool    `json:"enabled,omitempty"`
+	StreamOnly  *bool    `json:"streamOnly,omitempty"`
 	TokenLimit  *int64   `json:"tokenLimit,omitempty"`
 	CreditLimit *float64 `json:"creditLimit,omitempty"`
 }
@@ -139,6 +149,9 @@ func (h *Handler) apiUpdateApiKey(w http.ResponseWriter, r *http.Request, id str
 	}
 	if req.Enabled != nil {
 		patch.Enabled = *req.Enabled
+	}
+	if req.StreamOnly != nil {
+		patch.StreamOnly = *req.StreamOnly
 	}
 	if req.TokenLimit != nil {
 		patch.TokenLimit = *req.TokenLimit

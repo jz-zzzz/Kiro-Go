@@ -81,6 +81,10 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiPollBuilderIdAuth(w, r)
 	case path == "/auth/sso-token" && r.Method == "POST":
 		h.apiImportSsoToken(w, r)
+	case path == "/auth/kam-import" && r.Method == "POST":
+		h.apiKamImportStart(w, r)
+	case strings.HasPrefix(path, "/auth/kam-import/") && r.Method == "GET":
+		h.apiKamImportStatus(w, r, strings.TrimPrefix(path, "/auth/kam-import/"))
 	case path == "/auth/credentials" && r.Method == "POST":
 		h.apiImportCredentials(w, r)
 	case path == "/status" && r.Method == "GET":

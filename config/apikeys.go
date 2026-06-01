@@ -105,6 +105,7 @@ func UpdateApiKey(id string, patch ApiKeyEntry) error {
 		cfg.ApiKeys[idx].Key = newKey
 	}
 	cfg.ApiKeys[idx].Enabled = patch.Enabled
+	cfg.ApiKeys[idx].StreamOnly = patch.StreamOnly
 	cfg.ApiKeys[idx].TokenLimit = patch.TokenLimit
 	cfg.ApiKeys[idx].CreditLimit = patch.CreditLimit
 	if patch.Migrated {

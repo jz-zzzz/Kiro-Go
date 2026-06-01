@@ -2666,7 +2666,10 @@
     const disabled = !item.enabled
       ? '<span class="text-xs" style="background:rgba(239,68,68,0.15);color:#ef4444;padding:1px 6px;border-radius:4px;">' + escapeHtml(t('apiKeys.disabled')) + '</span>'
       : '';
-    return migrated + disabled;
+    const streamOnly = item.streamOnly
+      ? '<span class="text-xs" style="background:rgba(168,85,247,0.15);color:#a855f7;padding:1px 6px;border-radius:4px;">' + escapeHtml(t('apiKeys.streamOnlyBadge')) + '</span>'
+      : '';
+    return migrated + disabled + streamOnly;
   }
   function apiKeyName(item) {
     return item.name ? escapeHtml(item.name) : '<span class="muted-text">' + escapeHtml(t('apiKeys.unnamed')) + '</span>';
@@ -2786,6 +2789,7 @@
       keyEl.readOnly = false;
     }
     $('apiKeyForm_enabled').checked = entry ? !!entry.enabled : true;
+    $('apiKeyForm_streamOnly').checked = entry ? !!entry.streamOnly : false;
     $('apiKeyForm_tokenLimit').value = entry ? String(entry.tokenLimit || 0) : '0';
     $('apiKeyForm_creditLimit').value = entry ? String(entry.creditLimit || 0) : '0';
     apiKeyModalSubmitting = false;
@@ -2808,11 +2812,13 @@
     try {
       const name = $('apiKeyForm_name').value.trim();
       const enabled = $('apiKeyForm_enabled').checked;
+      const streamOnly = $('apiKeyForm_streamOnly').checked;
       const tokenLimit = parseInt($('apiKeyForm_tokenLimit').value, 10);
       const creditLimit = parseFloat($('apiKeyForm_creditLimit').value);
       const payload = {
         name: name,
         enabled: enabled,
+        streamOnly: streamOnly,
         tokenLimit: isNaN(tokenLimit) || tokenLimit < 0 ? 0 : tokenLimit,
         creditLimit: isNaN(creditLimit) || creditLimit < 0 ? 0 : creditLimit
       };
@@ -3081,6 +3087,7 @@
     else if (type === 'local') modalLocal(title, body);
     else if (type === 'credentials') modalCredentials(title, body);
     else if (type === 'cookie') modalCookie(title, body);
+    else if (type === 'kam') modalKam(title, body);
     if (!modal.classList.contains('active')) openDialog('addModal');
     enhanceCustomSelects(body);
   }
@@ -3100,6 +3107,7 @@
       methodCard('local', t('modal.localTitle'), t('modal.localDesc')) +
       methodCard('credentials', t('modal.credentialsTitle'), t('modal.credentialsDesc')) +
       methodCard('cookie', t('modal.cookieTitle'), t('modal.cookieDesc')) +
+      methodCard('kam', t('modal.kamTitle'), t('modal.kamDesc')) +
       '</div>' +
       '<div class="modal-footer"><button class="btn btn-secondary" data-close-add="1" type="button">' + escapeHtml(t('common.cancel')) + '</button></div>';
   }
@@ -3256,6 +3264,30 @@
       '</div>';
     $('importCookieBtn').addEventListener('click', importFromCookie);
   }
+  function modalKam(title, body) {
+    title.textContent = t('modal.kamTitle');
+    body.innerHTML =
+      '<p class="help-block">' + escapeHtml(t('modal.kamDesc')) + '</p>' +
+      '<p class="help-block">' + escapeHtml(t('kam.formatHint')) + '</p>' +
+      '<div class="form-group"><label>' + escapeHtml(t('kam.label')) + '</label>' +
+      '<div class="input-row">' +
+      '<textarea id="kamData" class="font-mono" placeholder=\'[{"refreshToken":"xxx","provider":"Google","email":"a@b.com"}]\'></textarea>' +
+      '<label class="btn btn-outline btn-sm">' + escapeHtml(t('kam.upload')) +
+      '<input type="file" accept=".json" id="kamFile" class="file-input-hidden" />' +
+      '</label>' +
+      '</div>' +
+      '</div>' +
+      '<div id="kamProgress" class="hidden">' +
+      '<div class="kam-progress-bar"><div id="kamProgressFill" class="kam-progress-fill"></div></div>' +
+      '<p id="kamProgressText" class="text-sm mt-2 muted-text"></p>' +
+      '</div>' +
+      '<div class="modal-footer">' +
+      '<button class="btn btn-secondary" data-modal-goto="add" type="button">' + escapeHtml(t('common.back')) + '</button>' +
+      '<button class="btn btn-primary" id="importKamBtn" type="button">' + escapeHtml(t('common.add')) + '</button>' +
+      '</div>';
+    $('importKamBtn').addEventListener('click', startKamImport);
+    $('kamFile').addEventListener('change', e => loadLocalFile(e.target, 'kamData'));
+  }
   function updateLocalFields() {
     const p = $('localProvider').value;
     $('localClientGroup').classList.toggle('hidden', p === 'Google' || p === 'Github');
@@ -3403,6 +3435,56 @@
       toastPrimary(t('cookie.importSuccess') + ': ' + (d.account?.email || d.account?.id));
       autoRefreshNewAccount(d.account?.id);
     } else toastError(t('common.failed') + ': ' + (d.error || ''));
+  }
+  let kamPollTimer = null;
+  async function startKamImport() {
+    const raw = $('kamData').value.trim();
+    if (!raw) { toastWarning(t('kam.emptyInput')); return; }
+    $('importKamBtn').disabled = true;
+    $('kamProgress').classList.remove('hidden');
+    $('kamProgressFill').style.width = '0%';
+    $('kamProgressText').textContent = t('kam.starting');
+    try {
+      const res = await api('/auth/kam-import', { method: 'POST', body: JSON.stringify({ data: raw }) });
+      const d = await res.json();
+      if (!d.success) { toastError(d.error || t('common.failed')); resetKamUI(); return; }
+      pollKamImport(d.jobId);
+    } catch (e) { toastError(t('common.failed') + ': ' + (e.message || '')); resetKamUI(); }
+  }
+  function pollKamImport(jobId) {
+    kamPollTimer = setInterval(async () => {
+      try {
+        const res = await api('/auth/kam-import/' + jobId);
+        const d = await res.json();
+        const pct = d.total > 0 ? Math.round(d.processed / d.total * 100) : 0;
+        $('kamProgressFill').style.width = pct + '%';
+        $('kamProgressText').textContent = t('kam.progress', d.processed, d.total, d.added, d.failed, d.skippedDup);
+        if (d.status === 'complete' || d.status === 'error') {
+          clearInterval(kamPollTimer); kamPollTimer = null;
+          closeModal(); loadAccounts(); loadStats();
+          let msg = t('kam.done', d.added);
+          if (d.skippedDup > 0) msg += ' ' + t('kam.skipped', d.skippedDup);
+          if (d.failed > 0) {
+            msg += ' ' + t('kam.failedRows', d.failed);
+            // Break the failures down so the operator knows whether a re-import
+            // will help: rate-limited rows are recoverable, dead tokens are not.
+            const parts = [];
+            if (d.failRateLimited > 0) parts.push(t('kam.failRateLimited', d.failRateLimited));
+            if (d.failDeadToken > 0) parts.push(t('kam.failDeadToken', d.failDeadToken));
+            if (d.failOther > 0) parts.push(t('kam.failOther', d.failOther));
+            if (parts.length > 0) msg += ' (' + parts.join(', ') + ')';
+            if (d.failRateLimited > 0) msg += ' ' + t('kam.reimportHint');
+          }
+          if (d.status === 'error') msg += ' ' + t('kam.persistError');
+          toastPrimary(msg, { duration: 12000 });
+        }
+      } catch { /* poll silently retries */ }
+    }, 2000);
+  }
+  function resetKamUI() {
+    $('importKamBtn').disabled = false;
+    $('kamProgress').classList.add('hidden');
+    if (kamPollTimer) { clearInterval(kamPollTimer); kamPollTimer = null; }
   }
   async function importSsoToken() {
     const res = await api('/auth/sso-token', {

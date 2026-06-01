@@ -4584,3 +4584,20 @@ img.brand-icon {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
+
+/* Bulk (kam) Import Progress */
+.kam-progress-bar {
+  width: 100%;
+  height: 8px;
+  background: var(--border-color, #e2e8f0);
+  border-radius: 4px;
+  overflow: hidden;
+  margin-top: 0.5rem;
+}
+.kam-progress-fill {
+  height: 100%;
+  width: 0%;
+  background: var(--color-primary);
+  border-radius: 4px;
+  transition: width 0.3s ease;
+}

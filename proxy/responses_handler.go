@@ -171,8 +171,7 @@ func (h *Handler) handleResponsesNonStream(
 			release()
 			lastErr = err
 			lastAccount = account
-			excluded[account.ID] = true
-			h.handleAccountFailure(account, err)
+			h.handleAccountError(account, excluded, err)
 			if shouldBackoffBeforeRetry(err) {
 				time.Sleep(retryBackoffAfterRateLimit())
 			}
@@ -206,8 +205,7 @@ func (h *Handler) handleResponsesNonStream(
 		if err != nil {
 			lastErr = err
 			lastAccount = account
-			excluded[account.ID] = true
-			h.handleAccountFailure(account, err)
+			h.handleAccountError(account, excluded, err)
 			if shouldBackoffBeforeRetry(err) {
 				time.Sleep(retryBackoffAfterRateLimit())
 			}
@@ -395,8 +393,7 @@ func (h *Handler) handleResponsesStream(
 			release()
 			lastErr = err
 			lastAccount = account
-			excluded[account.ID] = true
-			h.handleAccountFailure(account, err)
+			h.handleAccountError(account, excluded, err)
 			if shouldBackoffBeforeRetry(err) {
 				time.Sleep(retryBackoffAfterRateLimit())
 			}
@@ -553,8 +550,7 @@ func (h *Handler) handleResponsesStream(
 		if err != nil {
 			if !responseStarted {
 				lastErr = err
-				excluded[account.ID] = true
-				h.handleAccountFailure(account, err)
+				h.handleAccountError(account, excluded, err)
 				if shouldBackoffBeforeRetry(err) {
 					time.Sleep(retryBackoffAfterRateLimit())
 				}

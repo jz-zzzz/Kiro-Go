@@ -320,6 +320,29 @@ func effectiveUsageFraction(acc config.Account, allowOverUsage bool) float64 {
 	return acc.UsageCurrent / budget
 }
 
+// subscriptionTierRank returns a bonus that biases candidateOrderLocked
+// toward free-tier accounts so they are consumed before paid subscriptions.
+// The bonus is large enough (2.0) to dominate the 0..1 usage-fraction range.
+//   FREE      → +2.0  (consume first)
+//   (unknown) → +1.0  (neutral — no subscription info yet)
+//   PRO       →  0.0
+//   PRO_PLUS  → -1.0
+//   POWER     → -2.0  (consume last)
+func subscriptionTierRank(subscriptionType string) float64 {
+	switch strings.ToUpper(strings.TrimSpace(subscriptionType)) {
+	case "FREE":
+		return 2.0
+	case "PRO":
+		return 0.0
+	case "PRO_PLUS":
+		return -1.0
+	case "POWER":
+		return -2.0
+	default:
+		return 1.0 // unknown → between FREE and PRO
+	}
+}
+
 // modeRankLocked returns a preference score for acc under the given balance
 // mode; higher means the account should be picked sooner. Only "aggressive" and
 // "health" use ranking — "managed" keeps plain weighted round-robin and never
@@ -329,11 +352,14 @@ func (p *AccountPool) modeRankLocked(acc *config.Account, mode string, allowOver
 	case "aggressive":
 		// Concentrate load: prefer the account that is most utilized but still
 		// has headroom, so one account fills up before spilling to the next.
+		// Subscription-tier bonus biases the ranking so free-tier accounts
+		// are consumed first, preserving paid quota for when free is exhausted.
 		frac := effectiveUsageFraction(*acc, allowOverUsage)
+		rank := frac
 		if frac >= 1.0 {
-			return -frac // genuinely full: rank below every account with headroom
+			rank = -frac // genuinely full: rank below every account with headroom
 		}
-		return frac
+		return rank + subscriptionTierRank(acc.SubscriptionType)
 	case "health":
 		// Spread load to the healthiest/emptiest account.
 		reqs, qe, rate := p.getRecentStatsLocked(acc.ID, now)
@@ -697,15 +723,40 @@ func (p *AccountPool) tryAcquireForModel(model string, excluded map[string]bool,
 
 	var earliestWait time.Duration
 	busySeen := false
+
 	// tryAccount attempts to reserve a slot on acc. isStickyTarget marks the
 	// account currently pinned to affinityKey: only that account (or the first
 	// pin for a new conversation) updates the sticky map. Overflow picks to other
 	// accounts must NOT overwrite the pin, so the conversation returns to its
 	// cache-warm account once it frees up.
 	tryAccount := func(acc *config.Account, isStickyTarget bool) (*config.Account, bool) {
-		if !p.canRouteAccountLocked(acc, model, excluded, allowOverUsage, now, true) {
+		if acc == nil {
 			return nil, false
 		}
+		// --------------- model compatibility ---------------
+		if model != "" && !p.accountHasModel(acc.ID, model) {
+			return nil, false // truly incompatible — never wait
+		}
+
+		// --------------- transient unavailability ---------------
+		if excluded != nil && excluded[acc.ID] {
+			return nil, false // handler-level exclusion; pool cooldown handles pacing
+		}
+		if cooldown, ok := p.cooldowns[acc.ID]; ok && now.Before(cooldown) {
+			busySeen = true
+			if wait := cooldown.Sub(now); earliestWait <= 0 || wait < earliestWait {
+				earliestWait = wait
+			}
+			return nil, true
+		}
+		if !canRouteByToken(*acc, now) {
+			return nil, false // token expired — wait for refresh
+		}
+		if isQuotaBlocked(*acc, allowOverUsage) {
+			return nil, false // quota exhausted — wait for reset
+		}
+
+		// --------------- capacity limits ---------------
 		if p.routeActiveByAccount[acc.ID] >= rc.PerAccountMaxConcurrent {
 			busySeen = true
 			return nil, true
@@ -722,6 +773,8 @@ func (p *AccountPool) tryAcquireForModel(model string, excluded map[string]bool,
 				}
 			}
 		}
+
+		// --------------- acquire ---------------
 		p.routeGlobalActive++
 		p.routeActiveByAccount[acc.ID]++
 		p.routeLastStartByAccount[acc.ID] = now
@@ -799,6 +852,12 @@ func (p *AccountPool) tryAcquireForModel(model string, excluded map[string]bool,
 			return routingTryResult{account: copyAccount(selected)}, nil
 		}
 	}
+	// All candidates exhausted. Only transient cooldowns (which expire on their
+	// own) set busySeen above, so the queue waits just long enough for them to
+	// recover. Accounts blocked by handler-level exclusion, quota exhaustion or
+	// token expiry do NOT trigger waiting: those states do not self-heal within
+	// the queue window, so failing fast with ErrRoutingUnavailable is correct
+	// and avoids holding the caller for the full 30s queue timeout.
 	return routingTryResult{busy: busySeen, wait: earliestWait, notify: p.routeNotify}, nil
 }
 
@@ -1159,14 +1218,20 @@ func (p *AccountPool) RestoreAccount(id string) {
 	p.Reload()
 }
 
-// RecordTransient429 records a retryable upstream 429 without disabling or cooling
-// the account. These events are used for recent-429 visibility and health scoring,
-// but the account remains eligible for subsequent requests.
-func (p *AccountPool) RecordTransient429(id string) {
+// RecordTransient429 records a retryable upstream 429 without disabling the
+// account. These events are used for recent-429 visibility and health scoring.
+// When cooldown > 0 it also applies a short cooling window in the same critical
+// section so the pool-level queue can pace retries: tryAccount treats a cooling
+// account as busy and makes the AcquireForModel queue wait for it to recover,
+// which keeps a single model-compatible account from being hammered with 429s.
+func (p *AccountPool) RecordTransient429(id string, cooldown time.Duration) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.ensureRuntimeMapsLocked()
 	p.appendRequestEventLocked(id, true, true)
+	if cooldown > 0 {
+		p.cooldowns[id] = time.Now().Add(cooldown)
+	}
 }
 
 // RecordError 记录请求错误，设置冷却

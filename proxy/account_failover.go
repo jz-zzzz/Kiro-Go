@@ -145,7 +145,9 @@ func (h *Handler) handleAccountFailure(account *config.Account, err error) {
 	case isSuspicious429ErrorMessage(errMsg):
 		h.pool.QuarantineAccount429(account.ID)
 	case isTransient429ErrorMessage(errMsg):
-		h.pool.RecordTransient429(account.ID)
+		// Apply a short cooldown so the pool queue paces retries against the
+		// upstream rate-limit window instead of hammering the same account.
+		h.pool.RecordTransient429(account.ID, 5*time.Second)
 		logger.Warnf("[AccountFailover] Transient 429 for %s, keeping account enabled for retry", account.Email)
 	case isQuotaErrorMessage(errMsg):
 		h.pool.QuarantineAccount429(account.ID)
@@ -173,7 +175,9 @@ func (h *Handler) handleAccountTestFailure(account *config.Account, err error) {
 	case isSuspicious429ErrorMessage(errMsg):
 		h.pool.QuarantineAccount429(account.ID)
 	case isTransient429ErrorMessage(errMsg):
-		h.pool.RecordTransient429(account.ID)
+		// Manual test path: record the 429 for visibility but do NOT cool the
+		// account — a one-off probe should not pause live routing.
+		h.pool.RecordTransient429(account.ID, 0)
 		logger.Warnf("[AccountFailover] Manual test hit transient 429 for %s, keeping account enabled", account.Email)
 	case isQuotaErrorMessage(errMsg):
 		h.pool.QuarantineAccount429(account.ID)
@@ -188,5 +192,22 @@ func (h *Handler) handleAccountTestFailure(account *config.Account, err error) {
 		h.disableAccount(account, "DISABLED", "Authentication failed - token invalid or expired")
 	default:
 		h.disableAccount(account, "DISABLED", "Manual test failed: "+errMsg)
+	}
+}
+
+// handleAccountError is the single-point wrapper for recording an account
+// failure in a handler retry loop. It calls handleAccountFailure to apply
+// cooldowns / disable / quarantine, and manages the excluded map so that
+// transient 429 errors do NOT permanently exclude the account — the pool-level
+// cooldown handles pacing instead.
+func (h *Handler) handleAccountError(account *config.Account, excluded map[string]bool, err error) {
+	excluded[account.ID] = true
+	h.handleAccountFailure(account, err)
+	// Transient 429: the pool applies a short cooldown (5s). Clearing the
+	// handler-level exclusion lets the pool queue wait and retry the same
+	// account once the cooldown expires, instead of failing immediately when
+	// it is the only account that supports the requested model.
+	if isTransient429ErrorMessage(err.Error()) {
+		delete(excluded, account.ID)
 	}
 }

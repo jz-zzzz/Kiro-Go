@@ -300,8 +300,7 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 			release()
 			lastErr = err
 			lastAccount = account
-			excluded[account.ID] = true
-			h.handleAccountFailure(account, err)
+			h.handleAccountError(account, excluded, err)
 			continue
 		}
 		cacheUsage := h.promptCache.Compute(account.ID, cacheProfile)
@@ -631,8 +630,7 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 		if err != nil {
 			lastErr = err
 			lastAccount = account
-			excluded[account.ID] = true
-			h.handleAccountFailure(account, err)
+			h.handleAccountError(account, excluded, err)
 			if !messageStarted {
 				if shouldBackoffBeforeRetry(err) {
 					time.Sleep(retryBackoffAfterRateLimit())
@@ -756,8 +754,7 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 			release()
 			lastErr = err
 			lastAccount = account
-			excluded[account.ID] = true
-			h.handleAccountFailure(account, err)
+			h.handleAccountError(account, excluded, err)
 			continue
 		}
 		cacheUsage := h.promptCache.Compute(account.ID, cacheProfile)
@@ -797,8 +794,7 @@ func (h *Handler) handleClaudeNonStream(ctx context.Context, w http.ResponseWrit
 		if err != nil {
 			lastErr = err
 			lastAccount = account
-			excluded[account.ID] = true
-			h.handleAccountFailure(account, err)
+			h.handleAccountError(account, excluded, err)
 			if shouldBackoffBeforeRetry(err) {
 				time.Sleep(retryBackoffAfterRateLimit())
 			}

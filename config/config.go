@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 )
@@ -141,6 +142,18 @@ type ApiKeyEntry struct {
 	TokensUsed    int64   `json:"tokensUsed,omitempty"`
 	CreditsUsed   float64 `json:"creditsUsed,omitempty"`
 	RequestsCount int64   `json:"requestsCount,omitempty"`
+
+	// Cumulative prompt-cache attribution, used to display this key's observed
+	// simulated hit rate. CacheReadTokens / CacheCreationTokens are the reported
+	// read / creation token counts; CacheInputTokens is the cumulative input
+	// token basis (read + creation + downstream-billed) those were reported
+	// against. The observed hit rate is CacheReadTokens / CacheInputTokens, which
+	// shares one token basis between numerator and denominator and is therefore
+	// naturally bounded by 1. These numbers shape only what is reported
+	// downstream; they do not change how the upstream Kiro account is billed.
+	CacheReadTokens     int64 `json:"cacheReadTokens,omitempty"`
+	CacheCreationTokens int64 `json:"cacheCreationTokens,omitempty"`
+	CacheInputTokens    int64 `json:"cacheInputTokens,omitempty"`
 }
 
 // Config represents the global application configuration.
@@ -422,6 +435,44 @@ func AddAccount(account Account) error {
 	defer cfgLock.Unlock()
 	cfg.Accounts = append(cfg.Accounts, account)
 	return Save()
+}
+
+// AccountExistsByRefreshToken reports whether any account already holds the given
+// refresh token. An empty/blank token is never considered a duplicate (manual
+// entries may legitimately lack one). The match is exact after trimming.
+func AccountExistsByRefreshToken(refreshToken string) bool {
+	rt := strings.TrimSpace(refreshToken)
+	if rt == "" {
+		return false
+	}
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	for i := range cfg.Accounts {
+		if strings.TrimSpace(cfg.Accounts[i].RefreshToken) == rt {
+			return true
+		}
+	}
+	return false
+}
+
+// AddAccountIfNew atomically adds an account only if no existing account shares
+// its refresh token, returning whether it was added. The dedup check and the
+// append happen under one write-lock hold so concurrent imports of the same
+// credential can't both slip through (no TOCTOU window). A blank refresh token
+// disables dedup and the account is always added.
+func AddAccountIfNew(account Account) (bool, error) {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	rt := strings.TrimSpace(account.RefreshToken)
+	if rt != "" {
+		for i := range cfg.Accounts {
+			if strings.TrimSpace(cfg.Accounts[i].RefreshToken) == rt {
+				return false, nil
+			}
+		}
+	}
+	cfg.Accounts = append(cfg.Accounts, account)
+	return true, Save()
 }
 
 func UpdateAccount(id string, account Account) error {

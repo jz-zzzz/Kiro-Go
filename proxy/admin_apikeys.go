@@ -21,22 +21,44 @@ type apiKeyView struct {
 	TokensUsed    int64   `json:"tokensUsed"`
 	CreditsUsed   float64 `json:"creditsUsed"`
 	RequestsCount int64   `json:"requestsCount"`
+
+	// Cache reporting. CacheReadTokens / CacheCreationTokens are the cumulative
+	// reported prompt-cache token counts; CacheInputTokens is the cumulative
+	// input-token basis they were reported against. EffectiveHitRate is the
+	// observed simulated hit rate = CacheReadTokens / CacheInputTokens (shares one
+	// token basis, so it is naturally bounded by 1).
+	CacheReadTokens     int64   `json:"cacheReadTokens"`
+	CacheCreationTokens int64   `json:"cacheCreationTokens"`
+	CacheInputTokens    int64   `json:"cacheInputTokens"`
+	EffectiveHitRate    float64 `json:"effectiveHitRate"`
 }
 
 func toApiKeyView(e config.ApiKeyEntry) apiKeyView {
+	// EffectiveHitRate is the observed simulated cache hit rate: cumulative
+	// cache_read tokens over the cumulative input-token basis those reads were
+	// reported against. Numerator and denominator share one basis (input tokens),
+	// so the ratio is naturally in [0, 1] without any clamp.
+	var effective float64
+	if e.CacheInputTokens > 0 {
+		effective = float64(e.CacheReadTokens) / float64(e.CacheInputTokens)
+	}
 	return apiKeyView{
-		ID:            e.ID,
-		Name:          e.Name,
-		KeyMasked:     config.MaskApiKey(e.Key),
-		Enabled:       e.Enabled,
-		Migrated:      e.Migrated,
-		CreatedAt:     e.CreatedAt,
-		LastUsedAt:    e.LastUsedAt,
-		TokenLimit:    e.TokenLimit,
-		CreditLimit:   e.CreditLimit,
-		TokensUsed:    e.TokensUsed,
-		CreditsUsed:   e.CreditsUsed,
-		RequestsCount: e.RequestsCount,
+		ID:                  e.ID,
+		Name:                e.Name,
+		KeyMasked:           config.MaskApiKey(e.Key),
+		Enabled:             e.Enabled,
+		Migrated:            e.Migrated,
+		CreatedAt:           e.CreatedAt,
+		LastUsedAt:          e.LastUsedAt,
+		TokenLimit:          e.TokenLimit,
+		CreditLimit:         e.CreditLimit,
+		TokensUsed:          e.TokensUsed,
+		CreditsUsed:         e.CreditsUsed,
+		RequestsCount:       e.RequestsCount,
+		CacheReadTokens:     e.CacheReadTokens,
+		CacheCreationTokens: e.CacheCreationTokens,
+		CacheInputTokens:    e.CacheInputTokens,
+		EffectiveHitRate:    effective,
 	}
 }
 

@@ -38,6 +38,7 @@ type Handler struct {
 	modelsCacheTime int64
 	promptCache     *promptCacheTracker
 	tokenRefreshMu  sync.Mutex
+	reqLog          *requestLogger
 }
 
 type thinkingStreamSource int
@@ -225,6 +226,7 @@ func NewHandler() *Handler {
 		stopRefresh:     make(chan struct{}),
 		stopStatsSaver:  make(chan struct{}),
 		promptCache:     newPromptCacheTracker(defaultPromptCacheTTL),
+		reqLog:          newRequestLogger(defaultRequestLogCapacity),
 	}
 	// 启动后台刷新
 	go h.backgroundRefresh()
@@ -317,7 +319,7 @@ func (h *Handler) authenticateForClaude(w http.ResponseWriter, r *http.Request) 
 		h.sendClaudeError(w, ae.status, ae.code, ae.message)
 		return nil
 	}
-	return withApiKeyContext(r, entry)
+	return withClientIPContext(withApiKeyContext(r, entry))
 }
 
 // authenticateForOpenAI runs authenticate and writes an OpenAI-style error on failure.
@@ -331,7 +333,7 @@ func (h *Handler) authenticateForOpenAI(w http.ResponseWriter, r *http.Request) 
 		h.sendOpenAIError(w, ae.status, ae.code, ae.message)
 		return nil
 	}
-	return withApiKeyContext(r, entry)
+	return withClientIPContext(withApiKeyContext(r, entry))
 }
 
 // ServeHTTP 路由分发
@@ -817,15 +819,16 @@ func (h *Handler) handleClaudeMessagesInternal(w http.ResponseWriter, r *http.Re
 
 	// Stream or non-stream
 	apiKeyID := apiKeyIDFromContext(r.Context())
+	clientIP := clientIPFromContext(r.Context())
 	if req.Stream {
-		h.handleClaudeStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID)
+		h.handleClaudeStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID, clientIP)
 	} else {
-		h.handleClaudeNonStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID)
+		h.handleClaudeNonStream(w, kiroPayload, req.Model, thinking, thinkingResponseOpts, estimatedInputTokens, cacheProfile, apiKeyID, clientIP)
 	}
 }
 
 // handleClaudeStream Claude 流式响应
-func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string) {
+func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string, clientIP string) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -877,8 +880,11 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			h.handleAccountFailure(account, err)
 			continue
 		}
-		cacheUsage := h.promptCache.Compute(account.ID, cacheProfile)
-		messageStartUsage = cacheUsage
+		cacheFracs := h.promptCache.Compute(apiKeyID, cacheProfile)
+		// message_start carries provisional cache numbers against the estimator
+		// basis; the final message_delta below re-applies the same fractions to the
+		// settled input-token basis.
+		messageStartUsage = applyCacheFractions(startInputTokens, cacheFracs)
 
 		var inputTokens, outputTokens int
 		var credits float64
@@ -1232,10 +1238,16 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		}
 		outputTokens = estimateClaudeOutputTokens(outputContent, thinkingOutput, toolUses)
 
-		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
+		// Apply the simulated cache split to the settled input-token basis. Numerator
+		// (cache_read) and the recorded input basis now share one token basis, so the
+		// per-key observed hit rate stays in [0, 1].
+		cacheUsage := applyCacheFractions(inputTokens, cacheFracs)
+
+		h.recordSuccessForApiKeyWithCache(apiKeyID, inputTokens, outputTokens, credits, cacheUsage.CacheReadInputTokens, cacheUsage.CacheCreationInputTokens, inputTokens)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
-		h.promptCache.Update(account.ID, cacheProfile)
+		h.promptCache.Update(apiKeyID, cacheProfile)
+		h.recordRequestLog(account, clientIP, apiKeyID, model, "claude", true, inputTokens, outputTokens, cacheUsage.CacheReadInputTokens, cacheUsage.CacheCreationInputTokens, credits)
 
 		stopReason := "end_turn"
 		if len(toolUses) > 0 {
@@ -1325,13 +1337,77 @@ func (h *Handler) recordSuccess(inputTokens, outputTokens int, credits float64) 
 // When apiKeyID is empty (legacy single-key path or unauthenticated path), only the
 // global counters are updated. Persistence errors are logged but do not propagate.
 func (h *Handler) recordSuccessForApiKey(apiKeyID string, inputTokens, outputTokens int, credits float64) {
+	h.recordSuccessForApiKeyWithCache(apiKeyID, inputTokens, outputTokens, credits, 0, 0, 0)
+}
+
+// recordSuccessForApiKeyWithCache is recordSuccessForApiKey plus prompt-cache
+// attribution. cacheRead / cacheCreation are the reported read / creation token
+// counts; cacheInput is the input-token basis they were reported against
+// (read + creation + downstream-billed). All three are accumulated per key so the
+// admin view can show the observed simulated hit rate.
+func (h *Handler) recordSuccessForApiKeyWithCache(apiKeyID string, inputTokens, outputTokens int, credits float64, cacheRead, cacheCreation, cacheInput int) {
 	h.recordSuccess(inputTokens, outputTokens, credits)
 	if apiKeyID == "" {
 		return
 	}
-	if err := config.RecordApiKeyUsage(apiKeyID, int64(inputTokens+outputTokens), credits); err != nil {
+	if err := config.RecordApiKeyUsageWithCache(apiKeyID, int64(inputTokens+outputTokens), credits, int64(cacheRead), int64(cacheCreation), int64(cacheInput)); err != nil {
 		logger.Warnf("[ApiKey] failed to record usage for key %s: %v", apiKeyID, err)
 	}
+}
+
+// apiKeyDisplayName resolves an API key ID to a human-readable label for the live
+// request log: the key's name when set, otherwise its masked value, otherwise "-".
+// An empty apiKeyID (legacy single-key / unauthenticated path) yields "-".
+func apiKeyDisplayName(apiKeyID string) string {
+	if apiKeyID == "" {
+		return "-"
+	}
+	entry := config.GetApiKeyEntry(apiKeyID)
+	if entry == nil {
+		return "-"
+	}
+	if entry.Name != "" {
+		return entry.Name
+	}
+	if masked := config.MaskApiKey(entry.Key); masked != "" {
+		return masked
+	}
+	return "-"
+}
+
+// recordRequestLog appends one successful inference-API request to the in-memory
+// live log (and broadcasts it to SSE subscribers). account may be nil if routing
+// failed before an account was chosen, though success paths always pass one.
+func (h *Handler) recordRequestLog(account *config.Account, clientIP, apiKeyID, model, endpoint string, stream bool, inputTokens, outputTokens, cacheRead, cacheCreation int, credits float64) {
+	if h.reqLog == nil {
+		return
+	}
+	var email, accID string
+	if account != nil {
+		accID = account.ID
+		email = account.Email
+		if email == "" {
+			email = account.Nickname
+		}
+		if email == "" {
+			email = account.ID
+		}
+	}
+	h.reqLog.Record(RequestLogEntry{
+		AccountEmail:  email,
+		AccountID:     accID,
+		ClientIP:      clientIP,
+		KeyName:       apiKeyDisplayName(apiKeyID),
+		Model:         model,
+		InputTokens:   inputTokens,
+		OutputTokens:  outputTokens,
+		CacheRead:     cacheRead,
+		CacheCreation: cacheCreation,
+		Credits:       credits,
+		Endpoint:      endpoint,
+		Stream:        stream,
+		Status:        "success",
+	})
 }
 
 func (h *Handler) recordFailure() {
@@ -1340,7 +1416,7 @@ func (h *Handler) recordFailure() {
 }
 
 // handleClaudeNonStream Claude 非流式响应
-func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string) {
+func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, thinkingOpts claudeThinkingResponseOptions, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string, clientIP string) {
 	excluded := make(map[string]bool)
 	var lastErr error
 
@@ -1355,7 +1431,7 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 			h.handleAccountFailure(account, err)
 			continue
 		}
-		cacheUsage := h.promptCache.Compute(account.ID, cacheProfile)
+		cacheFracs := h.promptCache.Compute(apiKeyID, cacheProfile)
 
 		var content string
 		var thinkingContent string
@@ -1412,10 +1488,15 @@ func (h *Handler) handleClaudeNonStream(w http.ResponseWriter, payload *KiroPayl
 		}
 		outputTokens = estimateClaudeOutputTokens(finalContent, rawThinkingContent, toolUses)
 
-		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
+		// Apply the simulated cache split to the settled input-token basis so the
+		// per-key observed hit rate stays in [0, 1].
+		cacheUsage := applyCacheFractions(inputTokens, cacheFracs)
+
+		h.recordSuccessForApiKeyWithCache(apiKeyID, inputTokens, outputTokens, credits, cacheUsage.CacheReadInputTokens, cacheUsage.CacheCreationInputTokens, inputTokens)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
-		h.promptCache.Update(account.ID, cacheProfile)
+		h.promptCache.Update(apiKeyID, cacheProfile)
+		h.recordRequestLog(account, clientIP, apiKeyID, model, "claude", false, inputTokens, outputTokens, cacheUsage.CacheReadInputTokens, cacheUsage.CacheCreationInputTokens, credits)
 
 		responseThinkingContent := rawThinkingContent
 		includeEmptyThinkingBlock := thinking && thinkingOpts.OmitDisplay && rawThinkingContent != ""
@@ -1499,19 +1580,21 @@ func (h *Handler) handleOpenAIChat(w http.ResponseWriter, r *http.Request) {
 	actualModel, thinking := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
 	req.Model = actualModel
 	estimatedInputTokens := estimateOpenAIRequestInputTokens(&req)
+	cacheProfile := h.promptCache.BuildOpenAIProfile(&req, estimatedInputTokens)
 
 	kiroPayload := OpenAIToKiro(&req, thinking)
 
 	apiKeyID := apiKeyIDFromContext(r.Context())
+	clientIP := clientIPFromContext(r.Context())
 	if req.Stream {
-		h.handleOpenAIStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens, apiKeyID)
+		h.handleOpenAIStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens, cacheProfile, apiKeyID, clientIP)
 	} else {
-		h.handleOpenAINonStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens, apiKeyID)
+		h.handleOpenAINonStream(w, kiroPayload, req.Model, thinking, estimatedInputTokens, cacheProfile, apiKeyID, clientIP)
 	}
 }
 
 // handleOpenAIStream OpenAI 流式响应
-func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID string) {
+func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string, clientIP string) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -1540,6 +1623,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 			h.handleAccountFailure(account, err)
 			continue
 		}
+		cacheFracs := h.promptCache.Compute(apiKeyID, cacheProfile)
 
 		var toolCalls []ToolCall
 		var toolCallIndex int
@@ -1858,15 +1942,31 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 			outputTokens += estimateApproxTokens(tc.Function.Arguments)
 		}
 
-		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
+		// Apply the simulated prompt-cache split to the settled input-token basis
+		// and report cache_read as cached_tokens so downstream gateways (newapi)
+		// see a hit. Numerator and recorded input basis share one basis.
+		cacheUsage := applyCacheFractions(inputTokens, cacheFracs)
+		cachedTokens := cacheUsage.CacheReadInputTokens
+
+		h.recordSuccessForApiKeyWithCache(apiKeyID, inputTokens, outputTokens, credits, cachedTokens, cacheUsage.CacheCreationInputTokens, inputTokens)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
+		h.promptCache.Update(apiKeyID, cacheProfile)
+		h.recordRequestLog(account, clientIP, apiKeyID, model, "openai", true, inputTokens, outputTokens, cachedTokens, cacheUsage.CacheCreationInputTokens, credits)
 
 		finishReason := "stop"
 		if len(toolCalls) > 0 {
 			finishReason = "tool_calls"
 		}
 
+		usageMap := map[string]interface{}{
+			"prompt_tokens":     inputTokens,
+			"completion_tokens": outputTokens,
+			"total_tokens":      inputTokens + outputTokens,
+		}
+		if cachedTokens > 0 {
+			usageMap["prompt_tokens_details"] = map[string]int{"cached_tokens": cachedTokens}
+		}
 		chunk := map[string]interface{}{
 			"id":      chatID,
 			"object":  "chat.completion.chunk",
@@ -1877,11 +1977,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 				"delta":         map[string]interface{}{},
 				"finish_reason": finishReason,
 			}},
-			"usage": map[string]int{
-				"prompt_tokens":     inputTokens,
-				"completion_tokens": outputTokens,
-				"total_tokens":      inputTokens + outputTokens,
-			},
+			"usage": usageMap,
 		}
 		data, _ := json.Marshal(chunk)
 		fmt.Fprintf(w, "data: %s\n\n", string(data))
@@ -1900,7 +1996,7 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 }
 
 // handleOpenAINonStream OpenAI 非流式响应
-func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, apiKeyID string) {
+func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayload, model string, thinking bool, estimatedInputTokens int, cacheProfile *promptCacheProfile, apiKeyID string, clientIP string) {
 	excluded := make(map[string]bool)
 	var lastErr error
 
@@ -1915,6 +2011,7 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 			h.handleAccountFailure(account, err)
 			continue
 		}
+		cacheFracs := h.promptCache.Compute(apiKeyID, cacheProfile)
 
 		var content string
 		var reasoningContent string
@@ -1961,12 +2058,20 @@ func (h *Handler) handleOpenAINonStream(w http.ResponseWriter, payload *KiroPayl
 		}
 		outputTokens = estimateOpenAIOutputTokens(finalContent, reasoningContent, toolUses)
 
-		h.recordSuccessForApiKey(apiKeyID, inputTokens, outputTokens, credits)
+		// Apply the simulated prompt-cache split to the settled input-token basis
+		// and report cache_read as cached_tokens so downstream gateways (newapi)
+		// see a hit. Numerator and recorded input basis share one basis.
+		cacheUsage := applyCacheFractions(inputTokens, cacheFracs)
+		cachedTokens := cacheUsage.CacheReadInputTokens
+
+		h.recordSuccessForApiKeyWithCache(apiKeyID, inputTokens, outputTokens, credits, cachedTokens, cacheUsage.CacheCreationInputTokens, inputTokens)
 		h.pool.RecordSuccess(account.ID)
 		h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
+		h.promptCache.Update(apiKeyID, cacheProfile)
+		h.recordRequestLog(account, clientIP, apiKeyID, model, "openai", false, inputTokens, outputTokens, cachedTokens, cacheUsage.CacheCreationInputTokens, credits)
 
 		thinkingFormat := config.GetThinkingConfig().OpenAIFormat
-		resp := KiroToOpenAIResponseWithReasoning(finalContent, reasoningContent, toolUses, inputTokens, outputTokens, model, thinkingFormat)
+		resp := KiroToOpenAIResponseWithReasoning(finalContent, reasoningContent, toolUses, inputTokens, outputTokens, model, thinkingFormat, cachedTokens)
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		json.NewEncoder(w).Encode(resp)
 		return
@@ -2061,6 +2166,10 @@ func (h *Handler) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		h.apiGetAccounts(w, r)
 	case path == "/accounts" && r.Method == "POST":
 		h.apiAddAccount(w, r)
+	case path == "/logs" && r.Method == "GET":
+		h.apiGetLogs(w, r)
+	case path == "/logs/stream" && r.Method == "GET":
+		h.apiStreamLogs(w, r)
 	case path == "/accounts/batch" && r.Method == "POST":
 		h.apiBatchAccounts(w, r)
 	// models/refresh 必须在通用 /refresh 前匹配，否则会被误拦截
@@ -2236,9 +2345,19 @@ func (h *Handler) apiAddAccount(w http.ResponseWriter, r *http.Request) {
 		account.Region = "us-east-1"
 	}
 
-	if err := config.AddAccount(account); err != nil {
+	added, err := config.AddAccountIfNew(account)
+	if err != nil {
 		w.WriteHeader(500)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	if !added {
+		w.WriteHeader(409)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success":   false,
+			"duplicate": true,
+			"error":     "account with the same refresh token already exists",
+		})
 		return
 	}
 
@@ -2312,13 +2431,16 @@ func (h *Handler) apiUpdateAccount(w http.ResponseWriter, r *http.Request, id st
 	}
 
 	h.pool.Reload()
-	// 账号从禁用→启用时，自动拉取并缓存模型列表
-	if !oldEnabled && existing.Enabled && existing.AccessToken != "" {
-		go func(acc config.Account) {
-			if err := h.fetchAndCacheAccountModels(&acc); err != nil {
-				logger.Warnf("[ModelsCache] Auto-refresh failed for re-enabled account %s: %v", acc.Email, err)
-			}
-		}(*existing)
+	// 账号从禁用→启用时，清除残留冷却并自动拉取缓存模型列表
+	if !oldEnabled && existing.Enabled {
+		h.pool.ClearCooldown(id)
+		if existing.AccessToken != "" {
+			go func(acc config.Account) {
+				if err := h.fetchAndCacheAccountModels(&acc); err != nil {
+					logger.Warnf("[ModelsCache] Auto-refresh failed for re-enabled account %s: %v", acc.Email, err)
+				}
+			}(*existing)
+		}
 	}
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})
 }
@@ -2438,11 +2560,15 @@ func (h *Handler) apiBatchAccounts(w http.ResponseWriter, r *http.Request) {
 			idSet[id] = true
 		}
 		var toRefreshModels []config.Account
+		var toClearCooldown []string
 		for _, a := range accounts {
 			if idSet[a.ID] {
-				// 记录本次从禁用→启用、且有 token 的账号
-				if enabled && !a.Enabled && a.AccessToken != "" {
-					toRefreshModels = append(toRefreshModels, a)
+				// 记录本次从禁用→启用的账号
+				if enabled && !a.Enabled {
+					toClearCooldown = append(toClearCooldown, a.ID)
+					if a.AccessToken != "" {
+						toRefreshModels = append(toRefreshModels, a)
+					}
 				}
 				a.Enabled = enabled
 				if enabled && a.BanStatus != "" && a.BanStatus != "ACTIVE" {
@@ -2454,6 +2580,10 @@ func (h *Handler) apiBatchAccounts(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		h.pool.Reload()
+		// 清除本次新启用账号的残留冷却，避免被旧的禁用/超额冷却挡在轮询外
+		for _, id := range toClearCooldown {
+			h.pool.ClearCooldown(id)
+		}
 		// 为本次新启用的账号异步拉取模型缓存
 		for _, acc := range toRefreshModels {
 			go func(a config.Account) {
@@ -2586,9 +2716,19 @@ func (h *Handler) apiCompleteIamSso(w http.ResponseWriter, r *http.Request) {
 		MachineId:    config.GenerateMachineId(),
 	}
 
-	if err := config.AddAccount(account); err != nil {
+	added, err := config.AddAccountIfNew(account)
+	if err != nil {
 		w.WriteHeader(500)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	if !added {
+		w.WriteHeader(409)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success":   false,
+			"duplicate": true,
+			"error":     "account with the same refresh token already exists",
+		})
 		return
 	}
 
@@ -2677,9 +2817,20 @@ func (h *Handler) apiPollBuilderIdAuth(w http.ResponseWriter, r *http.Request) {
 		MachineId:    config.GenerateMachineId(),
 	}
 
-	if err := config.AddAccount(account); err != nil {
+	added, err := config.AddAccountIfNew(account)
+	if err != nil {
 		w.WriteHeader(500)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	if !added {
+		w.WriteHeader(409)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success":   false,
+			"completed": true,
+			"duplicate": true,
+			"error":     "account with the same refresh token already exists",
+		})
 		return
 	}
 
@@ -2715,6 +2866,7 @@ func (h *Handler) apiImportSsoToken(w http.ResponseWriter, r *http.Request) {
 	tokens := strings.Split(strings.TrimSpace(req.BearerToken), "\n")
 	var imported []map[string]interface{}
 	var errors []string
+	skipped := 0
 
 	for _, token := range tokens {
 		token = strings.TrimSpace(token)
@@ -2746,8 +2898,13 @@ func (h *Handler) apiImportSsoToken(w http.ResponseWriter, r *http.Request) {
 			MachineId:    config.GenerateMachineId(),
 		}
 
-		if err := config.AddAccount(account); err != nil {
+		added, err := config.AddAccountIfNew(account)
+		if err != nil {
 			errors = append(errors, err.Error())
+			continue
+		}
+		if !added {
+			skipped++
 			continue
 		}
 
@@ -2764,6 +2921,7 @@ func (h *Handler) apiImportSsoToken(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"success": false,
 			"error":   strings.Join(errors, "; "),
+			"skipped": skipped,
 		})
 		return
 	}
@@ -2772,6 +2930,7 @@ func (h *Handler) apiImportSsoToken(w http.ResponseWriter, r *http.Request) {
 		"success":  true,
 		"accounts": imported,
 		"errors":   errors,
+		"skipped":  skipped,
 	})
 }
 
@@ -2871,9 +3030,19 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 		ProfileArn:   newProfileArn,
 	}
 
-	if err := config.AddAccount(account); err != nil {
+	added, err := config.AddAccountIfNew(account)
+	if err != nil {
 		w.WriteHeader(500)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	if !added {
+		w.WriteHeader(409)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success":   false,
+			"duplicate": true,
+			"error":     "account with the same refresh token already exists",
+		})
 		return
 	}
 

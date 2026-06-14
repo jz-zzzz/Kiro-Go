@@ -244,10 +244,10 @@ func TestResetApiKeyUsage(t *testing.T) {
 
 func TestApiKeyOverLimit(t *testing.T) {
 	tests := []struct {
-		name        string
-		entry       ApiKeyEntry
-		wantToken   bool
-		wantCredit  bool
+		name       string
+		entry      ApiKeyEntry
+		wantToken  bool
+		wantCredit bool
 	}{
 		{"unlimited", ApiKeyEntry{TokensUsed: 100, CreditsUsed: 5}, false, false},
 		{"under token limit", ApiKeyEntry{TokenLimit: 200, TokensUsed: 100}, false, false},
@@ -291,5 +291,38 @@ func TestGenerateApiKeyValueIsUnique(t *testing.T) {
 	}
 	if len(a) < 10 {
 		t.Fatalf("expected non-trivial key length, got %q", a)
+	}
+}
+
+func TestRecordApiKeyUsageWithCache(t *testing.T) {
+	cfgFile := filepath.Join(t.TempDir(), "config.json")
+	if err := Init(cfgFile); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	created, err := AddApiKey(ApiKeyEntry{Key: "sk-cache", Enabled: true})
+	if err != nil {
+		t.Fatalf("AddApiKey: %v", err)
+	}
+	// read=600, creation=100, input basis=1000.
+	if err := RecordApiKeyUsageWithCache(created.ID, 1000, 0, 600, 100, 1000); err != nil {
+		t.Fatalf("RecordApiKeyUsageWithCache: %v", err)
+	}
+	entry := GetApiKeyEntry(created.ID)
+	if entry.CacheReadTokens != 600 || entry.CacheCreationTokens != 100 {
+		t.Fatalf("cache counters: read=%d creation=%d", entry.CacheReadTokens, entry.CacheCreationTokens)
+	}
+	if entry.CacheInputTokens != 1000 {
+		t.Fatalf("cache input basis: want 1000, got %d", entry.CacheInputTokens)
+	}
+	if entry.TokensUsed != 1000 {
+		t.Fatalf("tokens used: want 1000, got %d", entry.TokensUsed)
+	}
+	// Reset clears cache counters too.
+	if err := ResetApiKeyUsage(created.ID); err != nil {
+		t.Fatalf("ResetApiKeyUsage: %v", err)
+	}
+	entry = GetApiKeyEntry(created.ID)
+	if entry.CacheReadTokens != 0 || entry.CacheCreationTokens != 0 || entry.CacheInputTokens != 0 {
+		t.Fatalf("reset should clear cache counters, got read=%d creation=%d input=%d", entry.CacheReadTokens, entry.CacheCreationTokens, entry.CacheInputTokens)
 	}
 }

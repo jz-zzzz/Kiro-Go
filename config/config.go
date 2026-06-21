@@ -57,6 +57,8 @@ func defaultRoutingConcurrencyConfig() RoutingConcurrencyConfig {
 		PerAccountMinIntervalMs: 0,
 		StickyAccount:           true,
 		OverflowToOtherAccounts: true,
+		AccountRetryAttempts:    4,
+		Transient429CooldownMs:  5000,
 	}
 }
 
@@ -91,6 +93,12 @@ func normalizeRoutingConcurrencyConfig(in RoutingConcurrencyConfig) RoutingConcu
 	if !out.OverflowToOtherAccounts && isEmpty {
 		out.OverflowToOtherAccounts = def.OverflowToOtherAccounts
 	}
+	if out.AccountRetryAttempts <= 0 {
+		out.AccountRetryAttempts = def.AccountRetryAttempts
+	}
+	if out.Transient429CooldownMs <= 0 {
+		out.Transient429CooldownMs = def.Transient429CooldownMs
+	}
 	return out
 }
 
@@ -113,12 +121,14 @@ func Load() error {
 			// Create default configuration.
 			// Binds to 0.0.0.0 by default for Docker/container compatibility.
 			cfg = &Config{
-				Password:           "changeme",
-				Port:               8080,
-				Host:               "0.0.0.0",
-				RequireApiKey:      false,
-				Accounts:           []Account{},
-				RoutingConcurrency: defaultRoutingConcurrencyConfig(),
+				Password:                 "changeme",
+				Port:                     8080,
+				Host:                     "0.0.0.0",
+				RequireApiKey:            false,
+				Accounts:                 []Account{},
+				RoutingConcurrency:       defaultRoutingConcurrencyConfig(),
+				ServerReadTimeoutSeconds: 120,
+				ServerIdleTimeoutSeconds: 120,
 			}
 			return saveLocked()
 		}
@@ -131,6 +141,12 @@ func Load() error {
 	}
 	cfg = &c
 	cfg.RoutingConcurrency = normalizeRoutingConcurrencyConfig(cfg.RoutingConcurrency)
+	if cfg.ServerReadTimeoutSeconds <= 0 {
+		cfg.ServerReadTimeoutSeconds = 120
+	}
+	if cfg.ServerIdleTimeoutSeconds <= 0 {
+		cfg.ServerIdleTimeoutSeconds = 120
+	}
 
 	// Migration: if a legacy single ApiKey is present and the new ApiKeys list is empty,
 	// promote it into the new structure. The migrated entry inherits the legacy

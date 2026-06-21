@@ -51,7 +51,7 @@ func clientFacingOpenAIErrorType(status int) string {
 // produced a bare 500 with no log line, making the cause impossible to diagnose.
 func logRetryExhausted(protocol, model string, statusCode int, errType string, lastErr error) {
 	logger.Warnf("[%s] all %d account retry attempts exhausted (model=%s status=%d type=%s): %v",
-		protocol, maxAccountRetryAttempts, model, statusCode, errType, lastErr)
+		protocol, getAccountRetryAttempts(), model, statusCode, errType, lastErr)
 }
 
 func (h *Handler) acquireRouteAccount(ctx context.Context, model string, excluded map[string]bool, apiKeyID string) (*config.Account, func(), error) {

@@ -66,13 +66,14 @@ func main() {
 
 	// WriteTimeout intentionally 0: SSE streams can run for minutes while the
 	// upstream model produces tokens. ReadHeaderTimeout + ReadTimeout still
-	// guard against slowloris-style header/body stalls.
+	// guard against slowloris-style header/body stalls. Timeouts are read from
+	// config so operators can tune without rebuilding the image.
 	srv := &http.Server{
 		Addr:              addr,
 		Handler:           handler,
 		ReadHeaderTimeout: 30 * time.Second,
-		ReadTimeout:       60 * time.Second,
-		IdleTimeout:       120 * time.Second,
+		ReadTimeout:       time.Duration(config.GetServerReadTimeout()) * time.Second,
+		IdleTimeout:       time.Duration(config.GetServerIdleTimeout()) * time.Second,
 	}
 
 	if err := srv.ListenAndServe(); err != nil {

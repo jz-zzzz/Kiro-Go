@@ -154,7 +154,7 @@ func (h *Handler) handleResponsesNonStream(
 		}
 	}()
 
-	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
+	for attempt := 0; attempt < getAccountRetryAttempts(); attempt++ {
 		account, release, acquireErr := h.acquireRouteAccount(ctx, model, excluded, payload.RoutingAffinityKey)
 		if acquireErr != nil {
 			if isRoutingLimitError(acquireErr) {
@@ -369,7 +369,7 @@ func (h *Handler) handleResponsesStream(
 		}
 	}()
 
-	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
+	for attempt := 0; attempt < getAccountRetryAttempts(); attempt++ {
 		account, release, acquireErr := h.acquireRouteAccount(ctx, model, excluded, payload.RoutingAffinityKey)
 		if acquireErr != nil {
 			if isRoutingLimitError(acquireErr) {

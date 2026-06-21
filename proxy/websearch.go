@@ -471,7 +471,7 @@ func (h *Handler) fetchWebSearchResults(ctx context.Context, query, apiKeyID, mo
 
 	excluded := make(map[string]bool)
 	var lastAccount *config.Account
-	for attempt := 0; attempt < maxAccountRetryAttempts; attempt++ {
+	for attempt := 0; attempt < getAccountRetryAttempts(); attempt++ {
 		acct, release, acquireErr := h.acquireRouteAccount(ctx, model, excluded, apiKeyID)
 		if acquireErr != nil {
 			return nil, lastAccount, false, acquireErr

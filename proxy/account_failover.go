@@ -8,12 +8,27 @@ import (
 	"time"
 )
 
-// maxAccountRetryAttempts controls how many different accounts the proxy will
-// try before giving up and returning an error to the calling client. A value of
-// 7 with a 1–2 s backoff between rate-limit failures gives larger pools (1000+
-// accounts) enough runway to rotate past a cluster of simultaneously throttled
-// accounts, while still failing fast when the pool is genuinely drained.
-const maxAccountRetryAttempts = 7
+// getAccountRetryAttempts returns the max number of accounts the proxy tries
+// before giving up. Reads from config (hot-reloadable via admin API) with a
+// fallback of 4.
+func getAccountRetryAttempts() int {
+	rc := config.GetRoutingConcurrencyConfig()
+	if rc.AccountRetryAttempts > 0 {
+		return rc.AccountRetryAttempts
+	}
+	return 4
+}
+
+// getTransient429Cooldown returns the cooldown duration applied after a
+// transient (retryable) upstream 429. Reads from config with a default of 5s.
+func getTransient429Cooldown() time.Duration {
+	rc := config.GetRoutingConcurrencyConfig()
+	ms := rc.Transient429CooldownMs
+	if ms <= 0 {
+		ms = 5000
+	}
+	return time.Duration(ms) * time.Millisecond
+}
 
 // retryBackoffAfterRateLimit returns a short randomized sleep duration to insert
 // between retries after the previous attempt hit a rate-limit (429) error. The
@@ -145,9 +160,9 @@ func (h *Handler) handleAccountFailure(account *config.Account, err error) {
 	case isSuspicious429ErrorMessage(errMsg):
 		h.pool.QuarantineAccount429(account.ID)
 	case isTransient429ErrorMessage(errMsg):
-		// Apply a short cooldown so the pool queue paces retries against the
-		// upstream rate-limit window instead of hammering the same account.
-		h.pool.RecordTransient429(account.ID, 5*time.Second)
+		// Apply a configurable cooldown so the pool queue paces retries against
+		// the upstream rate-limit window instead of hammering the same account.
+		h.pool.RecordTransient429(account.ID, getTransient429Cooldown())
 		logger.Warnf("[AccountFailover] Transient 429 for %s, keeping account enabled for retry", account.Email)
 	case isQuotaErrorMessage(errMsg):
 		h.pool.QuarantineAccount429(account.ID)
@@ -203,10 +218,11 @@ func (h *Handler) handleAccountTestFailure(account *config.Account, err error) {
 func (h *Handler) handleAccountError(account *config.Account, excluded map[string]bool, err error) {
 	excluded[account.ID] = true
 	h.handleAccountFailure(account, err)
-	// Transient 429: the pool applies a short cooldown (5s). Clearing the
-	// handler-level exclusion lets the pool queue wait and retry the same
-	// account once the cooldown expires, instead of failing immediately when
-	// it is the only account that supports the requested model.
+	// Transient 429: the pool applies a configurable cooldown (via
+	// routingConcurrency.transient429CooldownMs, default 5000ms). Clearing
+	// the handler-level exclusion lets the pool queue wait and retry the
+	// same account once the cooldown expires, instead of failing immediately
+	// when it is the only account that supports the requested model.
 	if isTransient429ErrorMessage(err.Error()) {
 		delete(excluded, account.ID)
 	}

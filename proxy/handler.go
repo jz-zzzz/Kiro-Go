@@ -200,7 +200,7 @@ func (h *Handler) refreshAccountOverageIfExceeded(account *config.Account, info 
 	// over from a previous billing period instead of letting it linger (the bug
 	// where a reset quota still showed "206 / 10,000" overage points). No extra
 	// upstream call is needed — within-quota implies zero overage. The cap/rate
-	// billing config and the OverageStatus switch are preserved.
+	// billing config is preserved.
 	if info.UsageLimit <= 0 || info.UsageCurrent <= info.UsageLimit {
 		if clearErr := config.ClearAccountCurrentOverages(account.ID, time.Now().Unix()); clearErr != nil {
 			logger.Warnf("[Overage] failed to clear stale overage points for %s: %v", account.Email, clearErr)

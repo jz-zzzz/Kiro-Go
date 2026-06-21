@@ -357,6 +357,48 @@ func UpdateLogLevel(level string) error {
 	return Save()
 }
 
+// GetServerReadTimeout returns the configured ReadTimeout in seconds (default 120).
+func GetServerReadTimeout() int {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil || cfg.ServerReadTimeoutSeconds <= 0 {
+		return 120
+	}
+	return cfg.ServerReadTimeoutSeconds
+}
+
+// GetServerIdleTimeout returns the configured IdleTimeout in seconds (default 120).
+func GetServerIdleTimeout() int {
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	if cfg == nil || cfg.ServerIdleTimeoutSeconds <= 0 {
+		return 120
+	}
+	return cfg.ServerIdleTimeoutSeconds
+}
+
+// UpdateServerReadTimeout updates server ReadTimeout (requires restart to take effect).
+func UpdateServerReadTimeout(seconds int) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	if seconds <= 0 {
+		seconds = 120
+	}
+	cfg.ServerReadTimeoutSeconds = seconds
+	return Save()
+}
+
+// UpdateServerIdleTimeout updates server IdleTimeout (requires restart to take effect).
+func UpdateServerIdleTimeout(seconds int) error {
+	cfgLock.Lock()
+	defer cfgLock.Unlock()
+	if seconds <= 0 {
+		seconds = 120
+	}
+	cfg.ServerIdleTimeoutSeconds = seconds
+	return Save()
+}
+
 func GetKiroClientConfig() KiroClientConfig {
 	cfgLock.RLock()
 	defer cfgLock.RUnlock()

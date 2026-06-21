@@ -82,12 +82,14 @@ func (h *Handler) apiUpdatePromptFilter(w http.ResponseWriter, r *http.Request) 
 
 func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		ApiKey             *string                          `json:"apiKey,omitempty"`
-		RequireApiKey      *bool                            `json:"requireApiKey,omitempty"`
-		Password           string                           `json:"password,omitempty"`
-		AllowOverUsage     *bool                            `json:"allowOverUsage,omitempty"`
-		BalanceMode        *string                          `json:"balanceMode,omitempty"`
-		RoutingConcurrency *config.RoutingConcurrencyConfig `json:"routingConcurrency,omitempty"`
+		ApiKey                    *string                          `json:"apiKey,omitempty"`
+		RequireApiKey             *bool                            `json:"requireApiKey,omitempty"`
+		Password                  string                           `json:"password,omitempty"`
+		AllowOverUsage            *bool                            `json:"allowOverUsage,omitempty"`
+		BalanceMode               *string                          `json:"balanceMode,omitempty"`
+		RoutingConcurrency        *config.RoutingConcurrencyConfig `json:"routingConcurrency,omitempty"`
+		ServerReadTimeoutSeconds  *int                             `json:"serverReadTimeoutSeconds,omitempty"`
+		ServerIdleTimeoutSeconds  *int                             `json:"serverIdleTimeoutSeconds,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.WriteHeader(400)
@@ -120,6 +122,23 @@ func (h *Handler) apiUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.RoutingConcurrency != nil {
 		if err := config.UpdateRoutingConcurrencyConfig(*req.RoutingConcurrency); err != nil {
+			w.WriteHeader(500)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+	}
+
+	// Server timeouts — saved immediately but require a container restart to
+	// take effect (the HTTP server reads them only at startup).
+	if req.ServerReadTimeoutSeconds != nil {
+		if err := config.UpdateServerReadTimeout(*req.ServerReadTimeoutSeconds); err != nil {
+			w.WriteHeader(500)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+	}
+	if req.ServerIdleTimeoutSeconds != nil {
+		if err := config.UpdateServerIdleTimeout(*req.ServerIdleTimeoutSeconds); err != nil {
 			w.WriteHeader(500)
 			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 			return

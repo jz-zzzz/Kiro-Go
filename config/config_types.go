@@ -129,6 +129,14 @@ type RoutingConcurrencyConfig struct {
 	PerAccountMinIntervalMs int  `json:"perAccountMinIntervalMs,omitempty"`
 	StickyAccount           bool `json:"stickyAccount"`
 	OverflowToOtherAccounts bool `json:"overflowToOtherAccounts"`
+
+	// AccountRetryAttempts is the maximum number of accounts the proxy tries
+	// before returning an error. Default 4.
+	AccountRetryAttempts int `json:"accountRetryAttempts,omitempty"`
+
+	// Transient429CooldownMs is the cooldown in milliseconds applied after a
+	// transient (retryable) upstream 429. Default 5000 (5s).
+	Transient429CooldownMs int `json:"transient429CooldownMs,omitempty"`
 }
 
 // Config represents the global application configuration.
@@ -144,6 +152,13 @@ type Config struct {
 	SystemVersion string        `json:"systemVersion,omitempty"`
 	NodeVersion   string        `json:"nodeVersion,omitempty"`
 	Accounts      []Account     `json:"accounts"` // Registered Kiro accounts
+
+	// ServerReadTimeoutSeconds controls the maximum duration for reading the
+	// entire HTTP request (header + body). Default 120. Requires restart.
+	ServerReadTimeoutSeconds int `json:"serverReadTimeoutSeconds,omitempty"`
+	// ServerIdleTimeoutSeconds controls the maximum idle time between requests
+	// on a keep-alive connection. Default 120. Requires restart.
+	ServerIdleTimeoutSeconds int `json:"serverIdleTimeoutSeconds,omitempty"`
 
 	// Thinking mode configuration for extended reasoning output
 	ThinkingSuffix       string `json:"thinkingSuffix,omitempty"`       // Model suffix to trigger thinking mode (default: "-thinking")

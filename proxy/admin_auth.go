@@ -324,22 +324,21 @@ func (h *Handler) apiImportCredentials(w http.ResponseWriter, r *http.Request) {
 	}
 	newAccessToken, newRefreshToken, newExpiresAt, newProfileArn, err := auth.RefreshToken(tempAccount)
 	if err != nil {
-		// 刷新失败，如果有传入的 accessToken 则尝试使用
-		if req.AccessToken != "" {
-			accessToken = req.AccessToken
-			expiresAt = time.Now().Unix() + 300 // 可能已过期，设短一点
-		} else {
-			w.WriteHeader(400)
-			json.NewEncoder(w).Encode(map[string]string{"error": "Token refresh failed: " + err.Error()})
-			return
-		}
-	} else {
-		accessToken = newAccessToken
-		if newRefreshToken != "" {
-			req.RefreshToken = newRefreshToken
-		}
-		expiresAt = newExpiresAt
+		// Refresh failed: reject outright instead of falling back to the
+		// supplied accessToken. A fallback account is persisted with
+		// ExpiresAt = now+300, which the pool's Pick filter skips (now >
+		// ExpiresAt-120) within ~3 minutes, and the on-demand refresh path
+		// never repairs it (Pick filters it out before ensureValidToken runs).
+		// The caller must provide a refreshToken that actually works.
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Token refresh failed: " + err.Error()})
+		return
 	}
+	accessToken = newAccessToken
+	if newRefreshToken != "" {
+		req.RefreshToken = newRefreshToken
+	}
+	expiresAt = newExpiresAt
 
 	// 获取用户信息
 	email, _, _ := auth.GetUserInfo(accessToken)

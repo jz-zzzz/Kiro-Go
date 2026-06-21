@@ -4998,3 +4998,108 @@ img.brand-icon {
     grid-template-columns: repeat(2, 1fr);
   }
 }
+
+/* ==================== 账号分页 ==================== */
+.accounts-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  margin-top: 1rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--border);
+}
+.accounts-pagination.hidden {
+  display: none;
+}
+.pagination-info {
+  font-size: 0.8125rem;
+  color: var(--muted-foreground);
+  white-space: nowrap;
+}
+.pagination-controls {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+  flex-wrap: wrap;
+}
+.pagination-nav,
+.pagination-page {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 2rem;
+  height: 2rem;
+  padding: 0 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--card);
+  color: var(--foreground);
+  font-size: 0.8125rem;
+  cursor: pointer;
+  transition: background 0.12s, border-color 0.12s;
+}
+.pagination-nav:hover:not(:disabled),
+.pagination-page:hover:not(.active) {
+  background: var(--accent);
+  border-color: var(--border-focus);
+}
+.pagination-nav:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.pagination-page.active {
+  background: var(--primary);
+  color: var(--primary-foreground);
+  border-color: var(--primary);
+  font-weight: 600;
+  cursor: default;
+}
+.pagination-ellipsis {
+  display: inline-flex;
+  align-items: flex-end;
+  justify-content: center;
+  min-width: 1.5rem;
+  height: 2rem;
+  color: var(--muted-foreground);
+  font-size: 0.8125rem;
+}
+.pagination-size {
+  display: flex;
+  align-items: center;
+}
+.pagination-size label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.375rem;
+  font-size: 0.8125rem;
+  color: var(--muted-foreground);
+  white-space: nowrap;
+}
+.pagination-size-select {
+  height: 2rem;
+  padding: 0 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--card);
+  color: var(--foreground);
+  font-size: 0.8125rem;
+  cursor: pointer;
+}
+@media (max-width: 640px) {
+  .accounts-pagination {
+    justify-content: center;
+  }
+  .pagination-info,
+  .pagination-size {
+    width: 100%;
+    justify-content: center;
+    text-align: center;
+  }
+  .pagination-controls {
+    order: -1;
+    justify-content: center;
+    width: 100%;
+  }
+}

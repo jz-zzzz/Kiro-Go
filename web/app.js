@@ -21,6 +21,12 @@
   let filterProxy = 'all';
   let filterSort = 'health';
   let accountsViewMode = localStorage.getItem('accountsViewMode') === 'list' ? 'list' : 'card';
+  const ACCOUNTS_PAGE_SIZES = [20, 50, 100, 200];
+  let accountsPageSize = (() => {
+    const saved = parseInt(localStorage.getItem('accountsPageSize'), 10);
+    return ACCOUNTS_PAGE_SIZES.includes(saved) ? saved : 50;
+  })();
+  let accountsCurrentPage = 1;
   let privacyModeEnabled = true;
   let selectedBalanceMode = 'health';
   let promptRules = [];
@@ -1402,6 +1408,7 @@
     filterTier = ($('filterTierSelect') && $('filterTierSelect').value) || 'all';
     filterProxy = ($('filterProxySelect') && $('filterProxySelect').value) || 'all';
     filterSort = ($('filterSortSelect') && $('filterSortSelect').value) || 'health';
+    accountsCurrentPage = 1;
     renderAccounts();
   }
   function setStatusFilter(value) {
@@ -1411,6 +1418,7 @@
       syncCustomSelect(select);
     }
     filterStatus = value;
+    accountsCurrentPage = 1;
     renderAccounts();
   }
   function toggleSelectAll(checked) {
@@ -1429,15 +1437,24 @@
     const bar = $('batchBar');
     const count = selectedAccounts.size;
     const cb = $('selectAllCheckbox');
+    const filtered = getFilteredAccounts();
     if (cb) {
-      const filtered = getFilteredAccounts();
       const selectedFiltered = filtered.filter(a => selectedAccounts.has(a.id)).length;
       cb.checked = filtered.length > 0 && selectedFiltered === filtered.length;
       cb.indeterminate = selectedFiltered > 0 && selectedFiltered < filtered.length;
     }
     if (count > 0) {
       bar.classList.remove('hidden');
-      $('batchCount').textContent = String(count);
+      // Show selected count; when a filter narrows the list, hint that selection
+      // spans the whole filtered set (not just the visible page).
+      const el = $('batchCount');
+      if (el) {
+        if (filtered.length < accountsData.length) {
+          el.textContent = t('batch.selectedOfFiltered', count, filtered.length);
+        } else {
+          el.textContent = t('batch.selected', count);
+        }
+      }
     } else {
       bar.classList.add('hidden');
     }
@@ -1786,6 +1803,91 @@
       rows +
       '</div>';
   }
+  // Clamp accountsCurrentPage to the valid range for the given total, then
+  // return the slice of items belonging to the current page.
+  function getPageItems(filtered) {
+    const totalPages = Math.max(1, Math.ceil(filtered.length / accountsPageSize));
+    if (accountsCurrentPage > totalPages) accountsCurrentPage = totalPages;
+    if (accountsCurrentPage < 1) accountsCurrentPage = 1;
+    const start = (accountsCurrentPage - 1) * accountsPageSize;
+    return filtered.slice(start, start + accountsPageSize);
+  }
+  // Build a compact page-number sequence with ellipses, e.g.
+  // [1, '...', 4, 5, 6, '...', 20]. Always shows first/last and a window
+  // around the current page so the control stays narrow for large totals.
+  function buildPageSequence(current, totalPages) {
+    if (totalPages <= 7) {
+      return Array.from({ length: totalPages }, (_, i) => i + 1);
+    }
+    const pages = [1];
+    const left = Math.max(2, current - 1);
+    const right = Math.min(totalPages - 1, current + 1);
+    if (left > 2) pages.push('...');
+    for (let p = left; p <= right; p++) pages.push(p);
+    if (right < totalPages - 1) pages.push('...');
+    pages.push(totalPages);
+    return pages;
+  }
+  function renderPagination(totalItems) {
+    const el = $('accountsPagination');
+    if (!el) return;
+    const totalPages = Math.max(1, Math.ceil(totalItems / accountsPageSize));
+    if (accountsCurrentPage > totalPages) accountsCurrentPage = totalPages;
+    if (accountsCurrentPage < 1) accountsCurrentPage = 1;
+    // Hide the whole bar when there is nothing to paginate.
+    if (totalItems === 0) {
+      el.classList.add('hidden');
+      el.innerHTML = '';
+      return;
+    }
+    el.classList.remove('hidden');
+    const start = (accountsCurrentPage - 1) * accountsPageSize + 1;
+    const end = Math.min(totalItems, accountsCurrentPage * accountsPageSize);
+
+    const sizeOptions = ACCOUNTS_PAGE_SIZES.map(s =>
+      '<option value="' + s + '"' + (s === accountsPageSize ? ' selected' : '') + '>' + s + '</option>'
+    ).join('');
+
+    const prevDisabled = accountsCurrentPage <= 1 ? ' disabled' : '';
+    const nextDisabled = accountsCurrentPage >= totalPages ? ' disabled' : '';
+
+    const pageButtons = buildPageSequence(accountsCurrentPage, totalPages).map(p => {
+      if (p === '...') return '<span class="pagination-ellipsis">…</span>';
+      const active = p === accountsCurrentPage ? ' active' : '';
+      return '<button type="button" class="pagination-page' + active + '" data-page="' + p + '">' + p + '</button>';
+    }).join('');
+
+    el.innerHTML =
+      '<div class="pagination-info">' + escapeHtml(t('pagination.summary', start, end, totalItems)) + '</div>' +
+      '<div class="pagination-controls">' +
+      '<button type="button" class="pagination-nav" data-nav="prev"' + prevDisabled + ' aria-label="' + escapeAttr(t('pagination.prev')) + '">‹</button>' +
+      pageButtons +
+      '<button type="button" class="pagination-nav" data-nav="next"' + nextDisabled + ' aria-label="' + escapeAttr(t('pagination.next')) + '">›</button>' +
+      '</div>' +
+      '<div class="pagination-size"><label>' + escapeHtml(t('pagination.perPage')) + '<select id="pageSizeSelect" class="pagination-size-select">' + sizeOptions + '</select></label></div>';
+
+    enhanceCustomSelects(el);
+  }
+  function goToPage(page) {
+    const filtered = getFilteredAccounts();
+    const totalPages = Math.max(1, Math.ceil(filtered.length / accountsPageSize));
+    const target = Math.min(Math.max(1, page), totalPages);
+    if (target === accountsCurrentPage) return;
+    accountsCurrentPage = target;
+    renderAccounts();
+    const list = $('accountsList');
+    if (list && typeof list.scrollIntoView === 'function') {
+      list.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }
+  }
+  function setAccountsPageSize(size) {
+    const next = ACCOUNTS_PAGE_SIZES.includes(size) ? size : 50;
+    if (next === accountsPageSize) return;
+    accountsPageSize = next;
+    localStorage.setItem('accountsPageSize', String(next));
+    accountsCurrentPage = 1;
+    renderAccounts();
+  }
   function renderAccounts() {
     const container = $('accountsList');
     if (!container) return;
@@ -1794,16 +1896,19 @@
     renderAccountsViewToggle();
     if (filtered.length === 0) {
       container.innerHTML = '<div class="empty-state">' + escapeHtml(t('accounts.empty')) + '</div>';
+      renderPagination(0);
       updateBatchBar();
       return;
     }
+    const pageItems = getPageItems(filtered);
     if (accountsViewMode === 'list') {
-      container.innerHTML = renderAccountsListView(filtered);
+      container.innerHTML = renderAccountsListView(pageItems);
       applyUsageBars(container);
+      renderPagination(filtered.length);
       updateBatchBar();
       return;
     }
-    container.innerHTML = filtered.map(a => {
+    container.innerHTML = pageItems.map(a => {
       const mainUsage = getEffectiveUsageInfo(a);
       const overageUsage = getOverageInfo(a);
       const trialPct = getUsagePct(a.trialUsageCurrent, a.trialUsageLimit, a.trialUsagePercent);
@@ -1860,6 +1965,7 @@
     }).join('');
     applyUsageBars(container);
     enhanceCustomSelects(container);
+    renderPagination(filtered.length);
     updateBatchBar();
   }
 
@@ -4084,6 +4190,24 @@
     $('addAccountBtn').addEventListener('click', () => showModal('add'));
 
     $('selectAllCheckbox').addEventListener('change', e => toggleSelectAll(e.target.checked));
+    const pagination = $('accountsPagination');
+    if (pagination) {
+      // Pagination markup is rebuilt on every render, so delegate from the
+      // stable container instead of binding per-button.
+      pagination.addEventListener('click', e => {
+        const nav = e.target.closest('[data-nav]');
+        if (nav && !nav.disabled) {
+          goToPage(nav.dataset.nav === 'prev' ? accountsCurrentPage - 1 : accountsCurrentPage + 1);
+          return;
+        }
+        const pageBtn = e.target.closest('[data-page]');
+        if (pageBtn) goToPage(parseInt(pageBtn.dataset.page, 10));
+      });
+      pagination.addEventListener('change', e => {
+        const sel = e.target.closest('#pageSizeSelect');
+        if (sel) setAccountsPageSize(parseInt(sel.value, 10));
+      });
+    }
     qsa('[data-batch]').forEach(b => b.addEventListener('click', () => {
       const a = b.dataset.batch;
       if (a === 'refreshModels') batchRefreshModels();

@@ -134,6 +134,23 @@ func RefreshTokenExists(refreshToken string) bool {
 	return false
 }
 
+// AccountIDExists reports whether an account with the given id already exists.
+// Used by credential import to decide whether a pasted record's id can be reused
+// (re-importing a backup must not duplicate) or a fresh one must be minted.
+func AccountIDExists(id string) bool {
+	if id == "" {
+		return false
+	}
+	cfgLock.RLock()
+	defer cfgLock.RUnlock()
+	for i := range cfg.Accounts {
+		if cfg.Accounts[i].ID == id {
+			return true
+		}
+	}
+	return false
+}
+
 func UpdateAccount(id string, account Account) error {
 	cfgLock.Lock()
 	defer cfgLock.Unlock()

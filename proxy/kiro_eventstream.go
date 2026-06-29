@@ -24,6 +24,7 @@ func parseEventStream(ctx context.Context, body io.Reader, callback *KiroStreamC
 	var currentToolUse *toolUseState
 	var lastAssistantContent string
 	var lastReasoningContent string
+	var contentEventCount int
 
 	for {
 		// Stop promptly if the client disconnected or the request was cancelled,
@@ -38,13 +39,15 @@ func parseEventStream(ctx context.Context, body io.Reader, callback *KiroStreamC
 
 		// Prelude: 12 bytes (total_len + headers_len + crc)
 		prelude := make([]byte, 12)
-		_, err := io.ReadFull(body, prelude)
+		preludeN, err := io.ReadFull(body, prelude)
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
+			logger.Warnf("[EventStream] Prelude read failed at byte %d after %d content events: %v", preludeN, contentEventCount, err)
 			return err
 		}
+		contentEventCount++
 
 		totalLength := int(prelude[0])<<24 | int(prelude[1])<<16 | int(prelude[2])<<8 | int(prelude[3])
 		headersLength := int(prelude[4])<<24 | int(prelude[5])<<16 | int(prelude[6])<<8 | int(prelude[7])
@@ -58,6 +61,7 @@ func parseEventStream(ctx context.Context, body io.Reader, callback *KiroStreamC
 		msgBuf := make([]byte, remaining)
 		_, err = io.ReadFull(body, msgBuf)
 		if err != nil {
+			logger.Warnf("[EventStream] Message body read failed at event %d (totalLen=%d headersLen=%d): %v", contentEventCount, totalLength, headersLength, err)
 			return err
 		}
 
@@ -106,6 +110,8 @@ func parseEventStream(ctx context.Context, body io.Reader, callback *KiroStreamC
 					callback.OnContextUsage(pct)
 				}
 			}
+		default:
+			logger.Warnf("[EventStream] Unhandled event type=%q payload=%s", eventType, string(payloadBytes))
 		}
 	}
 

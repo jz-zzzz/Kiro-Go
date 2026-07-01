@@ -3842,20 +3842,20 @@
       '</div>' +
       '<div class="mt-3 p-3 border rounded" style="border-color:var(--border);background:var(--surface-secondary)">' +
       '<div class="flex items-center gap-2 mb-2">' +
-      '<span id="kiroSsoStepBadge" class="badge badge-primary" style="font-size:11px">Step 1</span>' +
-      '<span id="kiroSsoStepLabel" style="font-size:13px;font-weight:500">Paste the redirect URL from your browser address bar</span>' +
+      '<span id="kiroSsoStepBadge" class="badge badge-primary" style="font-size:11px">' + escapeHtml(t('kirosso.step1Badge')) + '</span>' +
+      '<span id="kiroSsoStepLabel" style="font-size:13px;font-weight:500">' + escapeHtml(t('kirosso.step1Label')) + '</span>' +
       '</div>' +
-      '<p id="kiroSsoStepHint" class="help-block" style="margin-bottom:6px;font-size:12px">After signing in, your browser will redirect to <code>localhost:3128</code>. Copy the full URL (Ctrl+L, Ctrl+C) and paste it here.</p>' +
+      '<p id="kiroSsoStepHint" class="help-block" style="margin-bottom:6px;font-size:12px">' + t('kirosso.step1Hint') + '</p>' +
       '<div class="flex gap-2">' +
       '<input id="kiroSsoCallbackUrl" class="flex-1" style="font-size:12px;font-family:monospace" placeholder="http://localhost:3128/signin/callback?..." autocomplete="off">' +
       '<button class="btn btn-sm btn-primary" id="kiroSsoSubmitCallbackBtn" type="button">' + escapeHtml(t('common.submit') || 'Submit') + '</button>' +
       '</div>' +
       '<div id="kiroSsoRedirectArea" class="hidden mt-2 p-2 rounded" style="background:var(--surface)">' +
-      '<p class="help-block" style="margin-bottom:4px;font-size:12px">Now open this Microsoft 365 login link, complete authentication, then come back and paste the next redirect URL:</p>' +
-      '<a id="kiroSsoRedirectLink" class="btn btn-sm btn-primary" target="_blank" href="#" style="word-break:break-all">Open Microsoft Login \u2197</a>' +
+      '<p class="help-block" style="margin-bottom:4px;font-size:12px">' + escapeHtml(t('kirosso.redirectHint')) + '</p>' +
+      '<a id="kiroSsoRedirectLink" class="btn btn-sm btn-primary" target="_blank" href="#" style="word-break:break-all">' + escapeHtml(t('kirosso.redirectLink')) + '</a>' +
       '</div>' +
       '</div>' +
-      '<p id="kiroSsoStatus" class="text-center text-sm mt-3" style="color:var(--warning)">Waiting for callback URL \u2014 paste the redirect from your browser above</p>' +
+      '<p id="kiroSsoStatus" class="text-center text-sm mt-3" style="color:var(--warning)">' + escapeHtml(t('kirosso.waiting')) + '</p>' +
       '<div class="modal-footer"><button class="btn btn-secondary" id="kiroSsoCancelBtn" type="button">' + escapeHtml(t('common.cancel')) + '</button></div>' +
       '</div>';
     $('startKiroSsoBtn').addEventListener('click', startKiroSsoLogin);
@@ -3887,9 +3887,9 @@
   async function submitKiroSsoCallback() {
     const url = $('kiroSsoCallbackUrl').value.trim();
     if (!url) return;
-    if (!kiroSsoSession) { toastError('No active SSO session'); return; }
+    if (!kiroSsoSession) { toastError(t('kirosso.noSession')); return; }
     $('kiroSsoSubmitCallbackBtn').disabled = true;
-    $('kiroSsoStatus').textContent = 'Processing callback...';
+    $('kiroSsoStatus').textContent = t('kirosso.processing');
     $('kiroSsoStatus').style.color = 'var(--muted)';
     try {
       const res = await api('/auth/kiro-sso/callback', {
@@ -3898,27 +3898,27 @@
       const d = await res.json();
       if (d.success && d.redirectUrl) {
         // Enterprise SSO leg-1: show Microsoft login, advance to step 2
-        $('kiroSsoStepBadge').textContent = 'Step 2';
-        $('kiroSsoStepLabel').textContent = 'Paste the final redirect URL after Microsoft login';
-        $('kiroSsoStepHint').innerHTML = 'After Microsoft 365 authentication, your browser will again redirect to <code>localhost:3128</code>. Copy and paste that final URL.';
+        $('kiroSsoStepBadge').textContent = t('kirosso.step2Badge');
+        $('kiroSsoStepLabel').textContent = t('kirosso.step2Label');
+        $('kiroSsoStepHint').innerHTML = t('kirosso.step2Hint');
         $('kiroSsoRedirectLink').href = d.redirectUrl;
         $('kiroSsoRedirectArea').classList.remove('hidden');
         $('kiroSsoCallbackUrl').placeholder = 'http://localhost:3128/oauth/callback?code=...';
-        $('kiroSsoStatus').textContent = '\u2191 Open the Microsoft login link above, then paste the next redirect URL';
+        $('kiroSsoStatus').textContent = t('kirosso.nextRedirect');
         $('kiroSsoStatus').style.color = 'var(--warning)';
         $('kiroSsoCallbackUrl').value = '';
         // Auto-open the Microsoft login link
         window.open(d.redirectUrl, '_blank');
       } else if (d.success) {
         // Leg-2 or social: polling will pick up the result
-        $('kiroSsoStatus').textContent = 'Callback accepted \u2014 completing login...';
+        $('kiroSsoStatus').textContent = t('kirosso.callbackAccepted');
         $('kiroSsoStatus').style.color = 'var(--success)';
         $('kiroSsoCallbackUrl').value = '';
       } else {
         toastError(t('common.failed') + ': ' + (d.error || ''));
       }
     } catch (e) {
-      toastError('Failed to submit callback: ' + e.message);
+      toastError(t('kirosso.submitFailed') + ': ' + e.message);
     } finally {
       $('kiroSsoSubmitCallbackBtn').disabled = false;
     }
@@ -3936,8 +3936,9 @@
         autoRefreshNewAccount(d.account?.id);
       } else if (d.success && !d.completed) {
         // Don't overwrite a manual-instruction status message
-        if (!$('kiroSsoStatus').textContent.includes('\u2191') && !$('kiroSsoStatus').textContent.includes('Step')) {
-          $('kiroSsoStatus').textContent = 'Waiting for callback URL \u2014 paste the redirect from your browser above';
+        const statusText = $('kiroSsoStatus').textContent;
+        if (statusText !== t('kirosso.nextRedirect') && statusText !== t('kirosso.processing')) {
+          $('kiroSsoStatus').textContent = t('kirosso.waiting');
           $('kiroSsoStatus').style.color = 'var(--warning)';
         }
         pollKiroSso(interval);

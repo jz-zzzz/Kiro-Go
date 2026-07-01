@@ -323,12 +323,21 @@ func (h *Handler) handleResponsesStream(
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
 
-	flusher, ok := w.(http.Flusher)
+	rawFlusher, ok := w.(http.Flusher)
 	if !ok {
 		h.sendOpenAIError(w, 500, "server_error", "Streaming not supported")
 		return
 	}
+	// Wrap w/flusher so every SSE frame write is mutex-guarded and a heartbeat
+	// goroutine can emit keep-alive comments during idle gaps without racing the
+	// handler's own writes. stop() blocks until the heartbeat goroutine exits.
+	// Heartbeats begin only after the first real frame is written.
+	guard := newSSEGuard(w, rawFlusher)
+	defer guard.stop()
+	w = guard
+	flusher := http.Flusher(guard)
 
 	send := func(eventName string, payload interface{}) {
 		data, err := json.Marshal(payload)

@@ -7,6 +7,7 @@ import (
 	"kiro-go/logger"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -126,36 +127,97 @@ func buildModelInfo(id, ownedBy string, supportsImage bool) map[string]interface
 	}
 }
 
-// refreshModelsCache 从 Kiro API 拉取模型列表并缓存
+// warmModelsCache populates the global models cache from the FIRST account that
+// successfully returns a model list, then stops. The available model set is
+// identical across accounts, so a single successful call is enough to serve
+// /v1/models with the real upstream list instead of the hard-coded fallback.
+// Unlike refreshModelsCache it does not sweep every account (potentially 1000+),
+// so it is cheap enough to run synchronously at startup without delaying the
+// rest of backgroundRefresh. The full per-account routing cache is still built
+// by the later refreshModelsCache sweep.
+func (h *Handler) warmModelsCache() {
+	// If a previous sweep already cached models (e.g. handler restarted while
+	// config persisted), don't bother.
+	h.modelsCacheMu.RLock()
+	already := len(h.cachedModels)
+	h.modelsCacheMu.RUnlock()
+	if already > 0 {
+		return
+	}
+
+	accounts := config.GetEnabledAccounts()
+	for i := range accounts {
+		account := &accounts[i]
+		if err := h.ensureValidToken(account); err != nil {
+			continue
+		}
+		models, err := ListAvailableModels(account)
+		if err != nil || len(models) == 0 {
+			continue
+		}
+		modelIDs := make([]string, 0, len(models))
+		for _, m := range models {
+			modelIDs = append(modelIDs, m.ModelId)
+		}
+		h.pool.SetModelList(account.ID, modelIDs)
+		h.modelsCacheMu.Lock()
+		h.cachedModels = mergeUniqueModels(h.cachedModels, models)
+		h.modelsCacheTime = time.Now().Unix()
+		h.modelsCacheMu.Unlock()
+		logger.Infof("[ModelsCache] Warm-started with %d models from %s", len(models), account.Email)
+		return
+	}
+}
+
+// refreshModelsCache 从 Kiro API 并发拉取所有已启用账号的模型列表并缓存。
+// 并发度与 refreshAllAccounts 一致（backgroundRefreshConcurrency=10），避免
+// 串行扫描 774 个账号耗时 6 分钟以上，导致 modelListsReady 迟迟无法置位。
 func (h *Handler) refreshModelsCache() {
 	accounts := config.GetEnabledAccounts()
 	if len(accounts) == 0 {
 		return
 	}
 
-	aggregated := make([]ModelInfo, 0)
+	var (
+		mu         sync.Mutex
+		aggregated []ModelInfo
+		wg         sync.WaitGroup
+		sem        = make(chan struct{}, backgroundRefreshConcurrency)
+	)
+
 	for i := range accounts {
 		account := &accounts[i]
-		if err := h.ensureValidToken(account); err != nil {
-			logger.Warnf("[ModelsCache] Skip %s token refresh failed: %v", account.Email, err)
-			h.handleAccountFailure(account, err)
-			continue
-		}
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(acc *config.Account) {
+			defer wg.Done()
+			defer func() { <-sem }()
 
-		models, err := ListAvailableModels(account)
-		if err != nil {
-			logger.Warnf("[ModelsCache] Failed to refresh for %s: %v", account.Email, err)
-			h.handleAccountFailure(account, err)
-			continue
-		}
-		// 缓存每账号可用模型，用于路由时过滤
-		modelIDs := make([]string, 0, len(models))
-		for _, m := range models {
-			modelIDs = append(modelIDs, m.ModelId)
-		}
-		h.pool.SetModelList(account.ID, modelIDs)
-		aggregated = mergeUniqueModels(aggregated, models)
+			if err := h.ensureValidToken(acc); err != nil {
+				logger.Warnf("[ModelsCache] Skip %s token refresh failed: %v", acc.Email, err)
+				h.handleAccountFailure(acc, err)
+				return
+			}
+
+			models, err := ListAvailableModels(acc)
+			if err != nil {
+				logger.Warnf("[ModelsCache] Failed to refresh for %s: %v", acc.Email, err)
+				h.handleAccountFailure(acc, err)
+				return
+			}
+			// 缓存每账号可用模型，用于路由时过滤
+			modelIDs := make([]string, 0, len(models))
+			for _, m := range models {
+				modelIDs = append(modelIDs, m.ModelId)
+			}
+			h.pool.SetModelList(acc.ID, modelIDs)
+
+			mu.Lock()
+			aggregated = mergeUniqueModels(aggregated, models)
+			mu.Unlock()
+		}(account)
 	}
+	wg.Wait()
 
 	if len(aggregated) > 0 {
 		h.modelsCacheMu.Lock()
@@ -164,6 +226,12 @@ func (h *Handler) refreshModelsCache() {
 		h.modelsCacheMu.Unlock()
 		logger.Infof("[ModelsCache] Cached %d models", len(aggregated))
 	}
+
+	// After the first complete sweep the per-account model lists are populated
+	// (or the account was skipped because it failed). From this point on,
+	// accountHasModel treats a missing list as "supports nothing", preventing
+	// premium models from leaking to free-tier accounts whose refresh failed.
+	h.pool.MarkModelListsReady()
 }
 
 // fetchAndCacheAccountModels 为单个账号拉取并写入模型缓存。

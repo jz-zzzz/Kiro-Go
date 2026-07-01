@@ -10,6 +10,7 @@ import (
 	"io"
 	"kiro-go/config"
 	"kiro-go/logger"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -69,8 +70,11 @@ func GetClientForProxy(proxyURL string) *http.Client {
 	if cached, ok := proxyClientCache.Load(proxyURL); ok {
 		return cached.(*http.Client)
 	}
+	// No whole-request Timeout: the streaming body can run for minutes while the
+	// model produces tokens. buildKiroTransport bounds connection setup and the
+	// response-header wait instead, and the request context handles client
+	// disconnects. A client.Timeout here would sever a healthy long stream.
 	client := &http.Client{
-		Timeout:   5 * time.Minute,
 		Transport: buildKiroTransport(proxyURL),
 	}
 	proxyClientCache.Store(proxyURL, client)
@@ -105,13 +109,34 @@ func ResolveAccountProxyURL(account *config.Account) string {
 }
 
 // buildKiroTransport constructs an HTTP Transport with optional outbound proxy support.
+//
+// Timeouts are scoped to connection establishment and the wait for response
+// headers, NOT the total request duration. A streaming chat completion can take
+// many minutes (extended thinking + long generation), and a whole-request
+// http.Client.Timeout would sever a healthy long stream mid-flight. The
+// connection-level bounds below still catch a dead/hung upstream (TCP dial, TLS
+// handshake, or a stalled server that accepts the request but never starts
+// responding) without capping a stream that is actively producing tokens.
+// Client disconnects are handled separately via the request context.
 func buildKiroTransport(proxyURL string) *http.Transport {
 	t := &http.Transport{
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
 		MaxIdleConns:        100,
 		MaxIdleConnsPerHost: 20,
 		IdleConnTimeout:     90 * time.Second,
-		DisableCompression:  false,
-		ForceAttemptHTTP2:   true,
+		TLSHandshakeTimeout: 15 * time.Second,
+		// ResponseHeaderTimeout bounds how long we wait for the upstream to send
+		// response headers after the request is written. Once headers arrive the
+		// (possibly minutes-long) streaming body read is unbounded. AWS Event
+		// Stream begins with headers promptly even when the model then spends
+		// minutes thinking, so 120s is ample headroom without masking a hang.
+		ResponseHeaderTimeout: 120 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		DisableCompression:    false,
+		ForceAttemptHTTP2:     true,
 	}
 	if proxyURL != "" {
 		if u, err := url.Parse(proxyURL); err == nil {
@@ -127,12 +152,17 @@ func buildKiroTransport(proxyURL string) *http.Transport {
 
 // InitKiroHttpClient initializes (or reinitializes) the HTTP clients used for Kiro API requests.
 func InitKiroHttpClient(proxyURL string) {
+	// Streaming client: no whole-request Timeout (see buildKiroTransport). The
+	// upstream stream can run for minutes; connection setup + response-header
+	// waits are bounded by the Transport, and client disconnects by the request
+	// context.
 	client := &http.Client{
-		Timeout:   5 * time.Minute,
 		Transport: buildKiroTransport(proxyURL),
 	}
 	kiroHttpStore.Store(client)
 
+	// REST client: short-lived non-streaming calls (token refresh, usage
+	// limits, profile ARN). A whole-request timeout is correct here.
 	restClient := &http.Client{
 		Timeout:   30 * time.Second,
 		Transport: buildKiroTransport(proxyURL),

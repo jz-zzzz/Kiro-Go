@@ -107,12 +107,22 @@ func (h *Handler) handleOpenAIStream(ctx context.Context, w http.ResponseWriter,
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
 
-	flusher, ok := w.(http.Flusher)
+	rawFlusher, ok := w.(http.Flusher)
 	if !ok {
 		h.sendOpenAIError(w, 500, "server_error", "Streaming not supported")
 		return
 	}
+	// Wrap w/flusher so every SSE frame write is mutex-guarded and a heartbeat
+	// goroutine can safely emit keep-alive comments during idle gaps (e.g. while
+	// the upstream is "thinking" and produces no client-visible frames). stop()
+	// blocks until the heartbeat goroutine exits, so no write races the handler
+	// return. Heartbeats begin only after the first real frame is written.
+	guard := newSSEGuard(w, rawFlusher)
+	defer guard.stop()
+	w = guard
+	flusher := http.Flusher(guard)
 
 	// 获取 thinking 输出格式配置
 	thinkingFormat := config.GetThinkingConfig().OpenAIFormat

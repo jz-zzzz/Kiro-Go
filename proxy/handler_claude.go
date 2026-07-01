@@ -230,12 +230,22 @@ func (h *Handler) handleClaudeStream(ctx context.Context, w http.ResponseWriter,
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		h.sendClaudeError(w, 500, "api_error", "Streaming not supported")
 		return
 	}
+
+	// Wrap the writer so an idle connection (long thinking gaps, dropped
+	// reasoning frames) is kept warm with periodic SSE pings, and so those
+	// pings never interleave with real frames. stop() blocks until the
+	// heartbeat goroutine exits, so no write races with the handler returning.
+	guard := newSSEGuard(w, flusher)
+	defer guard.stop()
+	w = guard
+	flusher = guard
 
 	requestStartedAt := time.Now()
 

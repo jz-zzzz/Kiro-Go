@@ -388,6 +388,98 @@ func TestReloadDropsOverQuotaAccountWhenAllowOverUsageDisabled(t *testing.T) {
 	}
 }
 
+// TestGetNextForModelSkipsOverQuotaAccountWhenAllowOverUsageDisabled verifies the
+// real-world routing path (model-scoped, mixed pool): with allowOverUsage off, an
+// account at 100% usage must be skipped in favor of a healthy one, rather than
+// being routed to and then failing/cooling. This is the regression that caused
+// mid-stream cutoffs when full free accounts were still dispatched.
+func TestGetNextForModelSkipsOverQuotaAccountWhenAllowOverUsageDisabled(t *testing.T) {
+	cfgFile := filepath.Join(t.TempDir(), "config.json")
+	if err := config.Init(cfgFile); err != nil {
+		t.Fatalf("config.Init: %v", err)
+	}
+	if err := config.UpdateAllowOverUsage(false); err != nil {
+		t.Fatalf("UpdateAllowOverUsage: %v", err)
+	}
+
+	p := &AccountPool{
+		accounts: []config.Account{
+			{ID: "full", Enabled: true, AccessToken: "t", ExpiresAt: time.Now().Add(time.Hour).Unix(), UsageCurrent: 50, UsageLimit: 50},
+			{ID: "healthy", Enabled: true, AccessToken: "t", ExpiresAt: time.Now().Add(time.Hour).Unix(), UsageCurrent: 5, UsageLimit: 50},
+		},
+		cooldowns:    make(map[string]time.Time),
+		errorCounts:  make(map[string]int),
+		modelLists:   make(map[string]map[string]bool),
+		currentIndex: ^uint64(0),
+	}
+	p.SetModelList("full", []string{"claude-sonnet-4.5"})
+	p.SetModelList("healthy", []string{"claude-sonnet-4.5"})
+
+	// Try several times: even with round-robin, the full account must never win.
+	for i := 0; i < 5; i++ {
+		acc := p.GetNextForModelExcluding("claude-sonnet-4.5", nil)
+		if acc == nil {
+			t.Fatalf("expected a routable account, got nil")
+		}
+		if acc.ID == "full" {
+			t.Fatalf("over-quota account routed despite allowOverUsage=false")
+		}
+	}
+}
+
+// TestModelListsReadyGate verifies that before MarkModelListsReady an account
+// without a cached model list is optimistically allowed (cold-start grace),
+// and after MarkModelListsReady it is rejected to prevent premium-model leakage.
+func TestModelListsReadyGate(t *testing.T) {
+	initPoolTestConfig(t)
+	if err := config.UpdateAllowOverUsage(true); err != nil {
+		t.Fatalf("UpdateAllowOverUsage: %v", err)
+	}
+
+	p := &AccountPool{
+		accounts: []config.Account{
+			{ID: "no-models", Enabled: true, AccessToken: "t", ExpiresAt: time.Now().Add(time.Hour).Unix()},
+			{ID: "has-models", Enabled: true, AccessToken: "t", ExpiresAt: time.Now().Add(time.Hour).Unix()},
+		},
+		cooldowns:    make(map[string]time.Time),
+		errorCounts:  make(map[string]int),
+		modelLists:   make(map[string]map[string]bool),
+		currentIndex: ^uint64(0),
+	}
+	// Only "has-models" gets a model list; "no-models" intentionally left empty.
+	p.SetModelList("has-models", []string{"premium-model"})
+
+	// Phase 1: modelListsReady is false (cold start) — no-models must pass.
+	if !p.modelListsReady {
+		acc := p.GetNextForModelExcluding("premium-model", nil)
+		if acc == nil {
+			t.Fatal("cold start: expected a routable account, got nil")
+		}
+		// Either account may win — no-models passes the model gate.
+		t.Logf("cold-start phase routed to %s", acc.ID)
+	} else {
+		t.Fatal("expected modelListsReady to be false initially")
+	}
+
+	// Phase 2: mark ready — no-models must NOT be selected for premium-model.
+	p.MarkModelListsReady()
+	if !p.modelListsReady {
+		t.Fatal("expected modelListsReady to be true after MarkModelListsReady")
+	}
+	for i := 0; i < 5; i++ {
+		acc := p.GetNextForModelExcluding("premium-model", nil)
+		if acc == nil {
+			t.Fatalf("iteration %d: no routable account", i)
+		}
+		if acc.ID == "no-models" {
+			t.Fatalf("iteration %d: no-models account routed for premium-model after MarkModelListsReady", i)
+		}
+		if acc.ID != "has-models" {
+			t.Fatalf("iteration %d: unexpected account %s", i, acc.ID)
+		}
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Local failover routing extensions
 // ---------------------------------------------------------------------------

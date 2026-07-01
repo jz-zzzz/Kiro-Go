@@ -200,11 +200,32 @@ func TestInitKiroHttpClientKeepsShortRestTimeout(t *testing.T) {
 	streamClient := kiroHttpStore.Load()
 	restClient := kiroRestHttpStore.Load()
 
-	if streamClient.Timeout != 5*time.Minute {
-		t.Fatalf("expected streaming timeout to be 5m, got %s", streamClient.Timeout)
+	// The streaming client must NOT carry a whole-request timeout: a streaming
+	// chat completion can run for many minutes (extended thinking + long
+	// generation), and a client.Timeout would sever a healthy long stream
+	// mid-flight. Connection setup and the response-header wait are bounded by
+	// the Transport instead (see buildKiroTransport / TestBuildKiroTransport*).
+	if streamClient.Timeout != 0 {
+		t.Fatalf("expected streaming client to have no whole-request timeout, got %s", streamClient.Timeout)
 	}
+	// REST calls are short and non-streaming (token refresh, usage limits,
+	// profile ARN), so a whole-request timeout is still correct there.
 	if restClient.Timeout != 30*time.Second {
 		t.Fatalf("expected REST timeout to stay 30s, got %s", restClient.Timeout)
+	}
+}
+
+// TestBuildKiroTransportBoundsConnectionNotStream verifies the streaming
+// transport bounds connection establishment and the response-header wait
+// (catching a dead/hung upstream) while leaving the streaming body read
+// unbounded (so a long but healthy stream is never severed).
+func TestBuildKiroTransportBoundsConnectionNotStream(t *testing.T) {
+	transport := buildKiroTransport("")
+	if transport.ResponseHeaderTimeout != 120*time.Second {
+		t.Fatalf("expected ResponseHeaderTimeout 120s, got %s", transport.ResponseHeaderTimeout)
+	}
+	if transport.TLSHandshakeTimeout != 15*time.Second {
+		t.Fatalf("expected TLSHandshakeTimeout 15s, got %s", transport.TLSHandshakeTimeout)
 	}
 }
 

@@ -109,6 +109,14 @@ type AccountPool struct {
 	lastAutoRestoreRefresh  time.Time
 	autoRestoreRefresh      bool
 
+	// modelListsReady is set to true once the first complete sweep of
+	// model-list fetching (refreshModelsCache) has finished. Before that,
+	// accountHasModel is optimistic (empty list → allow all). After it is
+	// true, the check is strict: an account without a cached model list is
+	// skipped during routing. This prevents premium models from leaking to
+	// free-tier accounts whose model lists failed to refresh.
+	modelListsReady bool
+
 	// Cumulative routing counters (lifetime since process start).
 	routeEnqueuedTotal  uint64 // requests that had to wait in the queue at least once
 	routeProcessedTotal uint64 // requests that successfully acquired a route slot
@@ -246,13 +254,32 @@ func (p *AccountPool) GetModelList(accountID string) []string {
 }
 
 // accountHasModel 检查账号是否支持指定模型。
-// 若该账号尚无模型列表（冷启动），视为支持所有模型。
+// 在首次完整模型列表刷新（MarkModelListsReady）完成之前乐观放行所有模型，
+// 避免冷启动时拒绝所有请求。刷新完成后严格检查：账号若无缓存模型列表则视为不支持任何模型。
 func (p *AccountPool) accountHasModel(accountID, model string) bool {
 	list, ok := p.modelLists[accountID]
 	if !ok || len(list) == 0 {
-		return true // 冷启动：列表未就绪，乐观放行
+		// 模型列表尚未就绪 → 乐观放行（冷启动保护）
+		if !p.modelListsReady {
+			return true
+		}
+		// 模型列表已就绪但该账号无缓存 → 拒绝
+		return false
 	}
 	return list[strings.ToLower(strings.TrimSpace(model))]
+}
+
+// MarkModelListsReady signals that the first complete sweep of per-account
+// model-list fetching has finished. After this, accountHasModel treats a
+// missing model list as "supports nothing" rather than "supports everything".
+
+// MarkModelListsReady signals that the first complete sweep of per-account
+// model-list fetching has finished. After this, accountHasModel treats a
+// missing model list as "supports nothing" rather than "supports everything".
+func (p *AccountPool) MarkModelListsReady() {
+	p.mu.Lock()
+	p.modelListsReady = true
+	p.mu.Unlock()
 }
 
 // GetNextForModel 获取下一个支持指定模型的可用账号。

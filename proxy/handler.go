@@ -92,8 +92,14 @@ func (h *Handler) backgroundRefresh() {
 	ticker := time.NewTicker(30 * time.Minute) // 每 30 分钟刷新一次
 	defer ticker.Stop()
 
-	// 启动时延迟 10 秒后执行一次
-	time.Sleep(10 * time.Second)
+	// 冷启动立即用首个可用账号拉一次真实模型列表，使 /v1/models 不必回退到
+	// 硬编码 fallback（fallback 列表需手动同步，易漏掉新模型）。这是轻量的单账号
+	// 调用。完整的 per-account 路由缓存与账号信息刷新立即跟随（并发化后 ~40s
+	// 可完成 774 个账号的扫描，不再需要 10s 延迟窗口）。
+	h.warmModelsCache()
+
+	// 给 HTTP server 一点时间稳定
+	time.Sleep(1 * time.Second)
 	h.refreshModelsCache()
 	h.refreshAllAccounts()
 
